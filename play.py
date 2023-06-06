@@ -7,9 +7,13 @@ import random
 import warnings
 from functools import partial
 from typing import NamedTuple
+import numpy as np
+#import torch
 
 import chex
 import jax
+#from jaxlib import xla_extension
+#jax.config.update('jax_array', False)
 import jax.numpy as jnp
 from fire import Fire
 
@@ -200,6 +204,38 @@ def main(
         input_dims=env.observation().shape,
         num_actions=env.num_actions(),
     )
+
+    """
+    def to_np(d, counter=0):
+        print(counter)
+        if counter > 20:
+            print('Counter above 20!!')
+            return
+        if isinstance(d, torch.Tensor):  #xla_extension.DeviceArray):
+            nparr = jnp.array(d.numpy())
+            print('Changed to jax')
+            return nparr
+        if isinstance(d, list):
+            return list([to_np(el, counter + 1) for el in d])
+        if isinstance(d, tuple):
+            return tuple([to_np(el, counter + 1) for el in d])
+        if isinstance(d, dict):
+            return dict({key: to_np(d[key], counter + 1) for key in d})
+    """
+
+
+#    with open("torczyk.pt", "rb") as f:
+ #       sd = torch.load(f)
+  #      sd = to_np(sd)
+   #     with open("new_ckpt.ckpt", "wb") as writer:
+    #        pickle.dump(sd, writer)
+        #return
+#    #    sd = sd["agent"]
+        #torch.save(sd, 'torczyk.pt')
+     #   return
+      #  print(sd)
+       # agent = agent.load_state_dict(sd)
+
     with open(ckpt_filename, "rb") as f:
         agent = agent.load_state_dict(pickle.load(f)["agent"])
     agent = agent.eval()
