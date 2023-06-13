@@ -2,7 +2,9 @@ import chex
 import jax
 import jax.numpy as jnp
 import pax
+from typing import TypeVar, List
 
+T = TypeVar("T", bound="Module")
 
 class ResidualBlock(pax.Module):
     """A residual block of conv layers
@@ -42,6 +44,7 @@ class ResnetPolicyValueNet(pax.Module):
         self, input_dims, num_actions: int, dim: int = 64, num_resblock: int = 5
     ) -> None:
         super().__init__()
+        self.dim = dim
         if len(input_dims) == 3:
             num_input_channels = input_dims[-1]
             input_dims = input_dims[:-1]
@@ -85,12 +88,7 @@ class ResnetPolicyValueNet(pax.Module):
         if not self.has_channel_dim:
             x = x[..., None]  # add channel dimension
         x = self.backbone(x)
-        action_logits = self.action_head(x)
-        value = self.value_head(x)
-        if batched:
-            return action_logits[:, 0, 0, :], value[:, 0, 0, 0]
-        else:
-            return action_logits[0, 0, 0, :], value[0, 0, 0, 0]
+        return x
 
 
 class ResnetPolicyValueNet128(ResnetPolicyValueNet):
@@ -109,3 +107,104 @@ class ResnetPolicyValueNet256(ResnetPolicyValueNet):
         self, input_dims, num_actions: int, dim: int = 256, num_resblock: int = 6
     ):
         super().__init__(input_dims, num_actions, dim, num_resblock)
+
+
+class OwnershipHeadShared(pax.Module):
+    def __init__(self, dim, input_dims, num_outputs):
+        super().__init__()
+        # Input is last layer of the ResNet concatenated with a mask
+        self.backbone = pax.Sequential(
+            pax.Conv2D(dim + 2, dim, 1),
+            pax.BatchNorm2D(dim, True, True),
+            jax.nn.relu,
+        )
+        self.ownership_head = pax.Sequential(
+            pax.Conv2D(dim, num_outputs, kernel_shape=input_dims, padding="VALID"),
+            jnp.tanh,
+        )
+        self.policy_head = pax.Sequential(
+            #pax.Conv2D(dim, dim, kernel_shape=input_dims, padding="VALID"),
+            #pax.BatchNorm2D(dim, True, True),
+            #jax.nn.relu,
+            pax.Conv2D(dim, 2 * num_outputs + 1, kernel_shape=1, padding="VALID"),
+        )
+
+    def __call__(self, x, batched=False):
+        x = self.backbone(x)
+        action_logits = self.policy_head(x)
+        ownership = self.ownership_head(x)
+
+        if batched:
+            return action_logits[:, 0, 0, :], ownership[:, 0, 0, :]
+        else:
+            return action_logits[0, 0, 0, :], ownership[0, 0, 0, :]
+
+
+class OwnershipHead(pax.Module):
+    def __init__(self, dim, input_dims, num_outputs):
+        super().__init__()
+        # Input is last layer of the ResNet concatenated with a mask
+        self.ownership_head = pax.Sequential(
+            pax.Conv2D(dim + 2, dim, 3),
+            pax.BatchNorm2D(dim, True, True),
+            jax.nn.relu,
+            pax.Conv2D(dim, num_outputs, kernel_shape=input_dims, padding="VALID"),
+            jnp.tanh,
+        )
+        self.policy_head = pax.Sequential(
+            #pax.Conv2D(dim, dim, kernel_shape=input_dims, padding="VALID"),
+            #pax.BatchNorm2D(dim, True, True),
+            #jax.nn.relu,
+            pax.Conv2D(dim + 2, dim, 3),
+            pax.BatchNorm2D(dim, True, True),
+            jax.nn.relu,
+            pax.Conv2D(dim, 2 * num_outputs + 1, kernel_shape=1, padding="VALID"),
+        )
+
+    def __call__(self, x, batched=False):
+        action_logits = self.policy_head(x)
+        ownership = self.ownership_head(x)
+
+        if batched:
+            return action_logits[:, 0, 0, :], ownership[:, 0, 0, :]
+        else:
+            return action_logits[0, 0, 0, :], ownership[0, 0, 0, :]
+
+
+class TransferResnet(pax.Module):
+    backbone: ResnetPolicyValueNet
+    head: OwnershipHead
+
+    def __init__(self, backbone: ResnetPolicyValueNet, input_dims=(19, 19)):
+        super().__init__()
+        # input_dims = backbone.input_dims
+        if len(input_dims) == 3:
+            input_dims = input_dims[:-1]
+            self.has_channel_dim = True
+        else:
+            self.has_channel_dim = False
+        self.backbone = backbone
+        dim = self.backbone.dim
+        self.num_intersections = input_dims[0] * input_dims[1]
+        self.head = OwnershipHead(dim=dim, input_dims=input_dims, num_outputs=self.num_intersections)
+
+    def __call__(self, input: List[chex.Array], batched: bool = False):
+        x, mask, board_mask = input
+        x = x.astype(jnp.float32)
+        mask = mask.astype(jnp.float32)
+        board_mask = board_mask.astype(jnp.float32)
+        x = self.backbone(x, batched=batched)
+        mask = mask[..., None]
+        if not batched:
+            mask = mask[None]
+        board_mask = board_mask[..., None]
+        if not batched:
+            board_mask = board_mask[None]
+        x = jnp.concatenate((x, mask), axis=-1)
+        x = jnp.concatenate((x, board_mask), axis=-1)
+        return self.head(x, batched=batched)
+
+    #def train(self: T) -> T:
+    #    self.apply(lambda mod: mod.replace(_training=True)) #super().train()
+    #    self.backbone = self.backbone.eval() #self.head.apply(lambda mod: mod.replace(_training=True))
+    #    return self

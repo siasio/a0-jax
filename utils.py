@@ -60,3 +60,11 @@ def select_tree(pred: jnp.ndarray, a, b):
     """Selects a pytree based on the given predicate."""
     assert pred.ndim == 0 and pred.dtype == jnp.bool_, "expected boolean scalar"
     return jax.tree_util.tree_map(partial(jax.lax.select, pred), a, b)
+
+
+def stack_last_state(state: jnp.ndarray):
+    num_recent_positions = 8
+    #state = state[None]
+    stacked = jnp.stack([state] * num_recent_positions)
+    stacked = jnp.concatenate((stacked, jnp.zeros_like(state)[None]))
+    return jnp.moveaxis(stacked, 0, -1)
