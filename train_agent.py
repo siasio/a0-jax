@@ -35,8 +35,8 @@ from typing import Tuple
 import datetime
 
 EPSILON = 1e-9  # a very small positive value
-TRAIN_DIR = "/home/test/PycharmProjects/EndgameBot/refined_logs/"
-TEST_DIR = "/home/test/PycharmProjects/EndgameBot/refined_logs_test/"
+TRAIN_DIR = "zip_logs"
+TEST_DIR = "test_dir"
 
 
 @chex.dataclass(frozen=True)
@@ -235,6 +235,18 @@ def collect_ownership_data(log_path):
                         continue
                     for datapoint in data_list:
                         mask, position_list, coords, color = datapoint
+
+                        if random.choice([0, 1]):
+                            position_list = [p[:, ::-1] for p in position_list]
+                            mask = mask[:, ::-1]
+                            if coords:
+                                coords = (coords[0], a0pos.pad_size - coords[1] - 1)
+                        if random.choice([0, 1]):
+                            position_list = [p[::-1, :] for p in position_list]
+                            mask = mask[::-1, :]
+                            if coords:
+                                coords = (a0pos.pad_size - coords[0] - 1, coords[1])
+
                         if coords is None:
                             move_loc = 2 * 19 * 19
                         else:
@@ -354,21 +366,24 @@ def test_ownership(net, data: TrainingOwnershipExample):
 
 @pax.pure
 def train(
-    game_class="games.connect_two_game.Connect2Game",
-    agent_class="policies.mlp_policy.MlpPolicyValueNet",
+    game_class="games.go_game.GoBoard9x9",
+    agent_class="policies.resnet_policy.ResnetPolicyValueNet128",
     selfplay_batch_size: int = 128,
     training_batch_size: int = 128,
     num_iterations: int = 20000,
     num_simulations_per_move: int = 32,
     num_self_plays_per_iteration: int = 128 * 100,
     learning_rate: float = 1e-3,  # Originally 0.01,
-    ckpt_filename: str = "./agent.ckpt",
+    ckpt_filename: str = "go_agent_9x9_128_sym.ckpt",
     trained_ckpt_filename: str = "trained.ckpt",
     root_dir: str = ".",
     random_seed: int = 42,
     weight_decay: float = 1e-4,
     lr_decay_steps: int = 100_000,
 ):
+    if root_dir == ".":
+        root_dir = os.path.dirname(os.getcwd())
+
     """Train an agent by self-play."""
     env = import_class(game_class)()
     agent = import_class(agent_class)(
@@ -414,12 +429,12 @@ def train(
 
     print(f"  time {datetime.datetime.now().strftime('%H:%M:%S')}")
 
-    pickle_test_path = os.path.join(TEST_DIR, 'data.pkl')
+    pickle_test_path = os.path.join(root_dir, TEST_DIR, 'data.pkl')
     if os.path.isfile(pickle_test_path):
         with open(pickle_test_path, "rb") as f:
             test_data = cloudpickle.load(f)
     else:
-        test_data = collect_ownership_data(TEST_DIR)
+        test_data = collect_ownership_data(os.path.join(root_dir, TEST_DIR))
         with open(pickle_test_path, "wb") as f:
             cloudpickle.dump(test_data, f)
 
@@ -452,26 +467,28 @@ def train(
     start_iter += 1
     num_iterations += 1
     unpacked = [0]
+    unpacked.extend([int(filename) for filename in os.listdir(os.path.join(root_dir, TRAIN_DIR)) if os.path.isdir(os.path.join(root_dir, TRAIN_DIR, filename))])
+    last_unpacked = max(unpacked)
+    print(f"Unpacked: {unpacked}")
 
     for iteration in range(start_iter, num_iterations):
         print(f"Iteration {iteration}")
-        pickle_path = os.path.join(TRAIN_DIR, f'datasmall{iteration:04}.pkl')
+        pickle_path = os.path.join(root_dir, TRAIN_DIR, f'datasmall{iteration:04}.pkl')
         if not os.path.isfile(pickle_path):
-            new_to_unpack = max(unpacked) + 1
-            zip_path = os.path.join(TRAIN_DIR, f'{new_to_unpack:04}.zip')
+            last_unpacked += 1
+            zip_path = os.path.join(root_dir, TRAIN_DIR, f'{last_unpacked:04}.zip')
             if not os.path.exists(zip_path[:-4]):
                 with zipfile.ZipFile(zip_path, "r") as zip_ref:
                     zip_ref.extractall(path=zip_path[:-4])
             unzipped = zip_path[:-4]
             for folder in os.listdir(unzipped):
                 small_counter += 1
-                cur_pickle_path = os.path.join(TRAIN_DIR, f'datasmall{small_counter:04}.pkl')
+                cur_pickle_path = os.path.join(root_dir, TRAIN_DIR, f'datasmall{small_counter:04}.pkl')
                 partial_data = collect_ownership_data(os.path.join(unzipped, folder))
                 with open(cur_pickle_path, "wb") as f:
                     cloudpickle.dump(partial_data, f)
                 shutil.rmtree(os.path.join(unzipped, folder), ignore_errors=True)
                 #data.extend(partial_data)
-            unpacked.append(new_to_unpack)
         with open(pickle_path, "rb") as f:
             data = cloudpickle.load(f)
 
@@ -496,7 +513,7 @@ def train(
         policy_loss = np.mean(sum(jax.device_get(policy_loss))) / len(policy_loss)
         transfer_model, optim = jax.tree_util.tree_map(lambda x: x[0], (transfer_model, optim))
 
-        if iteration % 20 == 0:
+        if iteration % 19 == 0:
             transfer_model = transfer_model.eval()
 
             accs = []
