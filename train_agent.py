@@ -438,37 +438,43 @@ def train(
         with open(pickle_test_path, "wb") as f:
             cloudpickle.dump(test_data, f)
 
-    transfer_model = transfer_model.eval()
+    # transfer_model = transfer_model.eval()
+    #
+    #
+    # accs = []
+    # mses = []
+    # ids = range(0, len(test_data) - training_batch_size, training_batch_size)
+    # with click.progressbar(ids, label="  test model   ") as progressbar:
+    #     for idx in progressbar:
+    #         batch = test_data[idx: (idx + training_batch_size)]
+    #         batch = [TrainingOwnershipExample(state=d.state, move=d.move, mask=d.mask, board_mask=d.board_mask,
+    #                                           value=d.value) for d in batch]
+    #         # batch = jax.tree_util.tree_map(_stack_and_reshape, *batch)
+    #         top_1_acc, mse = test_ownership(transfer_model, batch)
+    #         accs.append(top_1_acc)
+    #         mses.append(mse)
+    #
+    # top_1_acc = np.mean(accs)
+    # mse = np.mean(mses)
+    #
+    # print(
+    #     f"  test top 1 accuracy {top_1_acc:.3f}"
+    #     f"  test ownership map MSE {mse:.3f}"
+    #     f"  time {datetime.datetime.now().strftime('%H:%M:%S')}"
+    # )
 
-
-    accs = []
-    mses = []
-    ids = range(0, len(test_data) - training_batch_size, training_batch_size)
-    with click.progressbar(ids, label="  test model   ") as progressbar:
-        for idx in progressbar:
-            batch = test_data[idx: (idx + training_batch_size)]
-            batch = [TrainingOwnershipExample(state=d.state, move=d.move, mask=d.mask, board_mask=d.board_mask,
-                                              value=d.value) for d in batch]
-            # batch = jax.tree_util.tree_map(_stack_and_reshape, *batch)
-            top_1_acc, mse = test_ownership(transfer_model, batch)
-            accs.append(top_1_acc)
-            mses.append(mse)
-
-    top_1_acc = np.mean(accs)
-    mse = np.mean(mses)
-
-    print(
-        f"  test top 1 accuracy {top_1_acc:.3f}"
-        f"  test ownership map MSE {mse:.3f}"
-        f"  time {datetime.datetime.now().strftime('%H:%M:%S')}"
-    )
-
-    small_counter = 0
+    already_pickled = [int(filename[9:-4]) for filename in os.listdir(os.path.join(root_dir, TRAIN_DIR)) if filename.endswith('.pkl')]
+    try:
+        small_counter = max(already_pickled)
+    except ValueError:
+        small_counter = 0
     start_iter += 1
     num_iterations += 1
-    unpacked = [0]
-    unpacked.extend([int(filename) for filename in os.listdir(os.path.join(root_dir, TRAIN_DIR)) if os.path.isdir(os.path.join(root_dir, TRAIN_DIR, filename))])
-    last_unpacked = max(unpacked)
+    unpacked = [int(filename) for filename in os.listdir(os.path.join(root_dir, TRAIN_DIR)) if os.path.isdir(os.path.join(root_dir, TRAIN_DIR, filename))]
+    try:
+        last_unpacked = max(unpacked)
+    except ValueError:
+        last_unpacked = 0
     print(f"Unpacked: {unpacked}")
 
     for iteration in range(start_iter, num_iterations):
@@ -484,72 +490,72 @@ def train(
             for folder in os.listdir(unzipped):
                 small_counter += 1
                 cur_pickle_path = os.path.join(root_dir, TRAIN_DIR, f'datasmall{small_counter:04}.pkl')
-                partial_data = collect_ownership_data(os.path.join(unzipped, folder))
+                # partial_data = collect_ownership_data(os.path.join(unzipped, folder))
                 with open(cur_pickle_path, "wb") as f:
-                    cloudpickle.dump(partial_data, f)
+                    cloudpickle.dump({'a': 2}, f)
                 shutil.rmtree(os.path.join(unzipped, folder), ignore_errors=True)
                 #data.extend(partial_data)
         with open(pickle_path, "rb") as f:
             data = cloudpickle.load(f)
 
         print(f"  time {datetime.datetime.now().strftime('%H:%M:%S')}")
-        shuffler.shuffle(data)
-        old_model = jax.tree_util.tree_map(jnp.copy, transfer_model)
-        transfer_model, losses = transfer_model.train(), []
-        # transfer_model.backbone = pax.freeze_parameters(transfer_model.backbone)
-        transfer_model, optim = jax.device_put_replicated((transfer_model, optim), devices)
-        ids = range(0, len(data) - training_batch_size, training_batch_size)
-        with click.progressbar(ids, label="  train model   ") as progressbar:
-            for idx in progressbar:
-                batch = data[idx: (idx + training_batch_size)]
-                batch = [TrainingOwnershipExample(state=d.state, move=d.move, mask=d.mask, board_mask=d.board_mask,
-                                                  value=d.value) for d in batch]
-                batch = jax.tree_util.tree_map(_stack_and_reshape, *batch)
-                transfer_model, optim, loss = train_ownership_step(transfer_model, optim, batch)
-                losses.append(loss)
-
-        value_loss, policy_loss = zip(*losses)
-        value_loss = np.mean(sum(jax.device_get(loss))) / len(loss)
-        policy_loss = np.mean(sum(jax.device_get(policy_loss))) / len(policy_loss)
-        transfer_model, optim = jax.tree_util.tree_map(lambda x: x[0], (transfer_model, optim))
-
-        if iteration % 19 == 0:
-            transfer_model = transfer_model.eval()
-
-            accs = []
-            mses = []
-            ids = range(0, len(test_data) - training_batch_size, training_batch_size)
-            with click.progressbar(ids, label="  test model   ") as progressbar:
-                for idx in progressbar:
-                    batch = test_data[idx: (idx + training_batch_size)]
-                    # I needed to move axis
-                    batch = [TrainingOwnershipExample(state=d.state, move=d.move, mask=d.mask, board_mask=d.board_mask,
-                                                      value=d.value) for d in batch]
-                    # batch = jax.tree_util.tree_map(_stack_and_reshape, *batch)
-                    top_1_acc, mse = test_ownership(transfer_model, batch)
-                    accs.append(top_1_acc)
-                    mses.append(mse)
-
-            top_1_acc = np.mean(accs)
-            mse = np.mean(mses)
-
-            print(
-                f"  ownership loss {value_loss:.3f}"
-                f"  policy loss {policy_loss:.3f}"
-                f"  test top 1 accuracy {top_1_acc:.3f}"
-                f"  test ownership map MSE {mse:.3f}"
-                f"  learning rate {optim[1][-1].learning_rate:.1e}"
-                f"  time {datetime.datetime.now().strftime('%H:%M:%S')}"
-            )
-            # save agent's weights to disk
-            with open(os.path.join(root_dir, trained_ckpt_filename), "wb") as writer:
-                dic = {
-                    "agent": jax.device_get(transfer_model.state_dict()),
-                    "optim": jax.device_get(transfer_model.state_dict()),
-                    "iter": iteration,
-                }
-                pickle.dump(dic, writer)
-    print("Done!")
+    #     shuffler.shuffle(data)
+    #     old_model = jax.tree_util.tree_map(jnp.copy, transfer_model)
+    #     transfer_model, losses = transfer_model.train(), []
+    #     # transfer_model.backbone = pax.freeze_parameters(transfer_model.backbone)
+    #     transfer_model, optim = jax.device_put_replicated((transfer_model, optim), devices)
+    #     ids = range(0, len(data) - training_batch_size, training_batch_size)
+    #     with click.progressbar(ids, label="  train model   ") as progressbar:
+    #         for idx in progressbar:
+    #             batch = data[idx: (idx + training_batch_size)]
+    #             batch = [TrainingOwnershipExample(state=d.state, move=d.move, mask=d.mask, board_mask=d.board_mask,
+    #                                               value=d.value) for d in batch]
+    #             batch = jax.tree_util.tree_map(_stack_and_reshape, *batch)
+    #             transfer_model, optim, loss = train_ownership_step(transfer_model, optim, batch)
+    #             losses.append(loss)
+    #
+    #     value_loss, policy_loss = zip(*losses)
+    #     value_loss = np.mean(sum(jax.device_get(loss))) / len(loss)
+    #     policy_loss = np.mean(sum(jax.device_get(policy_loss))) / len(policy_loss)
+    #     transfer_model, optim = jax.tree_util.tree_map(lambda x: x[0], (transfer_model, optim))
+    #
+    #     if iteration % 19 == 0:
+    #         transfer_model = transfer_model.eval()
+    #
+    #         accs = []
+    #         mses = []
+    #         ids = range(0, len(test_data) - training_batch_size, training_batch_size)
+    #         with click.progressbar(ids, label="  test model   ") as progressbar:
+    #             for idx in progressbar:
+    #                 batch = test_data[idx: (idx + training_batch_size)]
+    #                 # I needed to move axis
+    #                 batch = [TrainingOwnershipExample(state=d.state, move=d.move, mask=d.mask, board_mask=d.board_mask,
+    #                                                   value=d.value) for d in batch]
+    #                 # batch = jax.tree_util.tree_map(_stack_and_reshape, *batch)
+    #                 top_1_acc, mse = test_ownership(transfer_model, batch)
+    #                 accs.append(top_1_acc)
+    #                 mses.append(mse)
+    #
+    #         top_1_acc = np.mean(accs)
+    #         mse = np.mean(mses)
+    #
+    #         print(
+    #             f"  ownership loss {value_loss:.3f}"
+    #             f"  policy loss {policy_loss:.3f}"
+    #             f"  test top 1 accuracy {top_1_acc:.3f}"
+    #             f"  test ownership map MSE {mse:.3f}"
+    #             f"  learning rate {optim[1][-1].learning_rate:.1e}"
+    #             f"  time {datetime.datetime.now().strftime('%H:%M:%S')}"
+    #         )
+    #         # save agent's weights to disk
+    #         with open(os.path.join(root_dir, trained_ckpt_filename), "wb") as writer:
+    #             dic = {
+    #                 "agent": jax.device_get(transfer_model.state_dict()),
+    #                 "optim": jax.device_get(transfer_model.state_dict()),
+    #                 "iter": iteration,
+    #             }
+    #             pickle.dump(dic, writer)
+    # print("Done!")
 
 
 """
