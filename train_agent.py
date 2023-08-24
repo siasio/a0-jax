@@ -29,7 +29,7 @@ from games.env import Enviroment
 from play import PlayResults, agent_vs_agent_multiple_games
 from tree_search import improve_policy_with_mcts, recurrent_fn
 from utils import batched_policy, env_step, import_class, replicate, reset_env, stack_last_state
-from policies.resnet_policy import TransferResnet
+from policies.resnet_policy import TransferResnet, ResnetPolicyValueNet128
 from local_pos_masks import AnalyzedPosition
 from typing import Tuple
 import datetime
@@ -37,6 +37,7 @@ import datetime
 EPSILON = 1e-9  # a very small positive value
 TRAIN_DIR = "zip_logs"
 TEST_DIR = "test_dir"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = '.79'
 
 
 @chex.dataclass(frozen=True)
@@ -58,6 +59,34 @@ class TrainingOwnershipExample:
     """AlphaZero training example.
 
     state: the current state of the game.
+    DEPRECATED move: the next move played locally, one-hot-encoded, shape: [2 * num_actions + 1].
+    mask: the binary mask of the local position which the network should evaluate.
+    board_mask: the binary mask of the board on which the game was played (all boards are padded to 19x19).
+    value: the expected ownership per intersection.
+    """
+
+    state: chex.Array
+    color_to_move: chex.Numeric
+    has_next_move: chex.Numeric
+    next_move_coords: chex.Array
+    next_move_color: chex.Numeric
+    mask: chex.Array
+    board_mask: chex.Array
+    value: chex.Array
+    # TODO: Think whether concatenating board mask to backbone output is the best solution
+
+    @classmethod
+    def from_obj(cls, obj: 'TrainingOwnershipExample', **kwargs):
+        init_fields = [f.name for f in cls.__dataclass_fields__.values() if f.init]
+        updated_fields = {field: kwargs.get(field, getattr(obj, field)) for field in init_fields}
+        return cls(**updated_fields)  # type : ignore - why does it not work?
+
+
+@chex.dataclass(frozen=True)
+class TrainingOwnershipDatapoint:
+    """AlphaZero training example.
+
+    state: the current state of the game.
     move: the next move played locally, one-hot-encoded, shape: [2 * num_actions + 1].
     mask: the binary mask of the local position which the network should evaluate.
     board_mask: the binary mask of the board on which the game was played (all boards are padded to 19x19).
@@ -65,11 +94,19 @@ class TrainingOwnershipExample:
     """
 
     state: chex.Array
+    color_to_move: chex.Numeric
     move: chex.Array
     mask: chex.Array
     board_mask: chex.Array
     value: chex.Array
-    # TODO: Think whether concatenating board mask to backbone output is the best solution
+
+    @classmethod
+    def from_obj(cls, obj: 'TrainingOwnershipExample', **kwargs):
+        init_fields = [f.name for f in cls.__dataclass_fields__.values() if f.init and f.name != 'move']
+        updated_fields = {field: kwargs.get(field, getattr(obj, field)) for field in init_fields}
+        move = construct_move_target(obj.has_next_move, obj.next_move_coords, obj.next_move_color)
+        updated_fields['move'] = move
+        return cls(**updated_fields)  # type : ignore - why does it not work?
 
 
 @chex.dataclass(frozen=True)
@@ -234,40 +271,26 @@ def collect_ownership_data(log_path):
                         print(e)
                         continue
                     for datapoint in data_list:
-                        mask, position_list, coords, color = datapoint
-
-                        if random.choice([0, 1]):
-                            position_list = [p[:, ::-1] for p in position_list]
-                            mask = mask[:, ::-1]
-                            if coords:
-                                coords = (coords[0], a0pos.pad_size - coords[1] - 1)
-                        if random.choice([0, 1]):
-                            position_list = [p[::-1, :] for p in position_list]
-                            mask = mask[::-1, :]
-                            if coords:
-                                coords = (a0pos.pad_size - coords[0] - 1, coords[1])
-
-                        if coords is None:
-                            move_loc = 2 * 19 * 19
-                        else:
-                            x, y = coords
-                            move_loc = 19 * x + y
-                            if color == -1:
-                                move_loc += 19 * 19
-                        move = np.zeros([2 * 19 * 19 + 1])
-                        try:
-                            move[move_loc] = 1
-                        except IndexError as e:
-                            print(e)
+                        mask, position_list, coords, color, value = datapoint
+                        has_next_move = True
+                        if coords is None or color is None:
+                            assert coords is None and color is None
+                            coords = (a0pos.pad_size, a0pos.pad_size)
+                            color = 0
+                            has_next_move = False
 
                         state = jnp.moveaxis(jnp.array(position_list), 0, -1)
 
-                        value = jnp.array(a0pos.continous_ownership).flatten()
+                        # value = jnp.array(a0pos.continous_ownership)  # .flatten()
                         example = TrainingOwnershipExample(state=state,
-                                                           move=jnp.array(move),
+                                                           has_next_move=jnp.array(has_next_move),
+                                                           next_move_color=jnp.array(color),
+                                                           next_move_coords=jnp.array(coords),
+                                                           color_to_move=jnp.array(-a0pos.last_color),
+                                                           # move=jnp.array(move),
                                                            mask=jnp.array(mask),
                                                            board_mask=jnp.array(a0pos.board_mask),
-                                                           value=value)
+                                                           value=jnp.array(value))
                         data.append(example)
     return data
 
@@ -292,6 +315,34 @@ def loss_fn(net, data: TrainingExample):
     return mse_loss + kl_loss, (net, (mse_loss, kl_loss))
 
 
+def apply_random_flips(d: TrainingOwnershipExample):
+    # TODO: add color flip?
+    state, mask, board_mask, has_next_move, coords, value, color_to_move, next_color = d.state, d.mask, d.board_mask, d.has_next_move, d.next_move_coords, d.value, d.color_to_move, d.next_move_color
+    if random.choice([0, 1]):
+        state = state[:, ::-1, :]
+        mask = mask[:, ::-1]
+        board_mask = board_mask[:, ::-1]
+        value = value[:, ::-1]
+        if has_next_move == 1:
+            coords = jnp.array((coords[0], mask.shape[1] - coords[1] - 1))
+    if random.choice([0, 1]):
+        state = state[::-1, :, :]
+        mask = mask[::-1, :]
+        board_mask = board_mask[::-1, :]
+        value = value[::-1, :]
+        if has_next_move == 1:
+            coords = jnp.array((mask.shape[0] - coords[0] - 1, coords[1]))
+    new_example = TrainingOwnershipExample.from_obj(
+        d,
+        state=state,
+        mask=mask,
+        board_mask=board_mask,
+        value=value,
+        next_move_coords=coords,
+    )
+    return new_example  # TrainingOwnershipExample(state=state, mask=mask, board_mask=board_mask, next_move_coords=coords, value=value, color_to_move=color_to_move, next_color=next_color)
+
+
 #def zero_grads():
 #    # from https://github.com/deepmind/optax/issues/159#issuecomment-896459491
 #    def init_fn(_):
@@ -303,25 +354,73 @@ def loss_fn(net, data: TrainingExample):
 #tx = optax.multi_transform({'adam': optax.adam(0.1), 'zero': zero_grads()},
 #                           create_mask(params, lambda s: s.startswith('frozen')))
 
-def ownership_loss_fn(net, data: TrainingOwnershipExample):
+def construct_move_target(has_next_move, coords, color):
+    if has_next_move == 0:
+        move_loc = 2 * 19 * 19
+    else:
+        x, y = coords
+        move_loc = 19 * x + y
+
+        # If next move is Black (1), then current move is White (-1), and we add 361 to the index in the possible next move coordinates array
+        if color == 1:
+            move_loc += 19 * 19
+    target_pr = np.zeros([2 * 19 * 19 + 1])
+    target_pr[move_loc] = 1
+    return target_pr
+
+
+def construct_flat_mask(data: TrainingOwnershipDatapoint):
+    def flatten_mask(mask_361):
+        single_flat = mask_361.reshape(mask_361.shape[0], -1)
+        full_flat = jnp.ones((single_flat.shape[0], 723), dtype=jnp.bool_)
+        full_flat = full_flat.at[..., :361].set(single_flat)
+        full_flat = full_flat.at[..., 361:722].set(single_flat)
+        return full_flat
+
+    allowed_moves_mask = (data.mask == 1) & (data.state[..., 7] == 0)
+    return flatten_mask(allowed_moves_mask)
+
+
+def construct_training_datapoint(d: TrainingOwnershipExample):
+    new_datapoint = TrainingOwnershipDatapoint.from_obj(d)
+    return new_datapoint
+
+
+def ownership_loss_fn(net, data: TrainingOwnershipDatapoint):
     """Sum of value loss and policy loss."""
     net, (action_logits, ownership_map) = batched_policy(net, (data.state, data.mask, data.board_mask))
 
-    mse_loss = optax.l2_loss(ownership_map * data.mask.reshape(data.mask.shape[0], -1), data.value * data.mask.reshape(data.mask.shape[0], -1))
+    target_pr = data.move
+    # to avoid log(0) = nan
+    # target_pr = jnp.where(target_pr == 0, EPSILON, target_pr)
+    flattened_ownership_mask = data.mask.reshape(data.mask.shape[0], -1)
+    mse_loss = optax.l2_loss(ownership_map * flattened_ownership_mask, data.value.reshape(data.value.shape[0], -1) * flattened_ownership_mask)
     mse_loss = jnp.mean(mse_loss)
 
     # policy loss (KL(target_policy', agent_policy))
-    target_pr = data.move
-    # to avoid log(0) = nan
-    target_pr = jnp.where(target_pr == 0, EPSILON, target_pr)
-    action_logits = jax.nn.log_softmax(action_logits, axis=-1)
+    log_action_logits = jax.nn.log_softmax(action_logits, axis=-1)
+    soft_action_logits = jax.nn.softmax(action_logits, axis=-1)
     # TODO: Is KL loss a good choice when my target is categorical (one-hot encoded) and not an array of probabilities?
+    #  ANSWER: No
 
-    kl_loss = jnp.sum(target_pr * (jnp.log(target_pr) - action_logits), axis=-1)
-    kl_loss = jnp.mean(kl_loss)
+    flat_mask = construct_flat_mask(data)
+    penalty_weight = 2.
+
+    # target_pr_valid = target_pr[flat_mask]
+    # action_logits_valid = action_logits[flat_mask]
+
+    cross_entropy_loss = - jnp.sum(target_pr * log_action_logits, axis=-1)
+    cross_entropy_loss = jnp.mean(cross_entropy_loss)  # SF: is it a mean over a batch?
+
+    # Penalty term for moves outside the mask
+    action_logits_invalid = soft_action_logits * (1 - flat_mask)
+    invalid_moves_penalty = penalty_weight * jnp.sum(action_logits_invalid, axis=-1)
+    invalid_moves_penalty = jnp.mean(invalid_moves_penalty)
+
+    total_loss = cross_entropy_loss + invalid_moves_penalty
 
     # return the total loss
-    return mse_loss + kl_loss, (net, (mse_loss, kl_loss))
+    return mse_loss + total_loss, (net, (mse_loss, total_loss))
 
 
 @partial(jax.pmap, axis_name="i")
@@ -334,7 +433,7 @@ def train_step(net, optim, data: TrainingExample):
 
 
 @partial(jax.pmap, axis_name="i")
-def train_ownership_step(net, optim, data: TrainingOwnershipExample):
+def train_ownership_step(net, optim, data: TrainingOwnershipDatapoint):
     """A training step."""
     #data.state = net.backbone(data.state, data.mask, data.board_mask, batched=True)
     (_, (net, losses)), grads = jax.value_and_grad(ownership_loss_fn, has_aux=True)(net, data)
@@ -344,9 +443,12 @@ def train_ownership_step(net, optim, data: TrainingOwnershipExample):
 
 
 #@partial(jax.pmap, axis_name="i")
-def test_ownership(net, data: TrainingOwnershipExample):
+def test_ownership(net, data: TrainingOwnershipDatapoint):
+    # This function has outdated code
     """Evaluation on test set."""
+    # SF: This if is redundant, it's not a list anyway, it's a dynamic jaxpr tracer - NO, IT'S NOT
     if isinstance(data, list):
+        #print('VERY UNEXPECTED IF USAGE')
         state = jnp.stack(list(d.state for d in data))
         mask = jnp.stack(list(d.mask for d in data))
         board_mask = jnp.stack(list(d.board_mask for d in data))
@@ -360,7 +462,7 @@ def test_ownership(net, data: TrainingOwnershipExample):
         value = data.value
     action_logits, ownership_map = net((state, mask, board_mask), batched=True)
     top_1_acc = (action_logits.argmax(axis=1) == move.argmax(axis=1)).mean()
-    mse_loss = optax.l2_loss(ownership_map * mask.reshape(mask.shape[0], -1), value * mask.reshape(mask.shape[0], -1))
+    mse_loss = optax.l2_loss(ownership_map * mask.reshape(mask.shape[0], -1), value.reshape(value.shape[0], -1) * mask.reshape(mask.shape[0], -1))
     return top_1_acc, mse_loss
 
 
@@ -369,7 +471,7 @@ def train(
     game_class="games.go_game.GoBoard9x9",
     agent_class="policies.resnet_policy.ResnetPolicyValueNet128",
     selfplay_batch_size: int = 128,
-    training_batch_size: int = 128,
+    training_batch_size: int = 128,  # Originally 128 but maybe I'm getting OOM
     num_iterations: int = 20000,
     num_simulations_per_move: int = 32,
     num_self_plays_per_iteration: int = 128 * 100,
@@ -391,30 +493,43 @@ def train(
         num_actions=env.num_actions(),
     )
 
+    # STAS-08: moved the following lines loading weights before transfer_model definition
+    ckpt_path = os.path.join(root_dir, ckpt_filename)
+    trained_ckpt_path = os.path.join(root_dir, trained_ckpt_filename)
+    if os.path.isfile(ckpt_path):
+        if os.path.isfile(trained_ckpt_path):
+            agent = ResnetPolicyValueNet128(input_dims=(9, 9, 9), num_actions=82)
+            start_iter = 0  # TODO: it should be different
+        else:
+            print("Loading weights at", ckpt_filename)
+            with open(ckpt_path, "rb") as f:
+                dic = pickle.load(f)
+                if "agent" in dic:
+                    dic = dic["agent"]
+                agent = agent.load_state_dict(dic)
+                #optim = optim.load_state_dict(dic["optim"])
+                start_iter = 0 #dic["iter"] + 1
+    else:
+        start_iter = 0
     def lr_schedule(step):
         e = jnp.floor(step * 1.0 / lr_decay_steps)
         return learning_rate * jnp.exp2(-e)
 
-    # agent = agent.eval()
     transfer_model = TransferResnet(agent)
+
+    if os.path.isfile(trained_ckpt_path):
+        print('Loading trained weights at', trained_ckpt_filename)
+        with open(trained_ckpt_path, "rb") as f:
+            loaded_agent = pickle.load(f)
+            if "agent" in loaded_agent:
+                loaded_agent = loaded_agent["agent"]
+            transfer_model = transfer_model.load_state_dict(loaded_agent)
 
     optim = opax.chain(
         opax.add_decayed_weights(weight_decay),
         opax.sgd(lr_schedule, momentum=0.9),
     ).init(transfer_model.parameters())
 
-    ckpt_path = os.path.join(root_dir, ckpt_filename)
-    if os.path.isfile(ckpt_path):
-        print("Loading weights at", ckpt_filename)
-        with open(ckpt_path, "rb") as f:
-            dic = pickle.load(f)
-            if "agent" in dic:
-                dic = dic["agent"]
-            agent = agent.load_state_dict(dic)
-            #optim = optim.load_state_dict(dic["optim"])
-            start_iter = 0 #dic["iter"] + 1
-    else:
-        start_iter = 0
 
 
     rng_key = jax.random.PRNGKey(random_seed)
@@ -429,7 +544,7 @@ def train(
 
     print(f"  time {datetime.datetime.now().strftime('%H:%M:%S')}")
 
-    pickle_test_path = os.path.join(root_dir, TEST_DIR, 'data.pkl')
+    pickle_test_path = os.path.join(root_dir, TEST_DIR, 'test_data.pkl')
     if os.path.isfile(pickle_test_path):
         with open(pickle_test_path, "rb") as f:
             test_data = cloudpickle.load(f)
@@ -490,72 +605,75 @@ def train(
             for folder in os.listdir(unzipped):
                 small_counter += 1
                 cur_pickle_path = os.path.join(root_dir, TRAIN_DIR, f'datasmall{small_counter:04}.pkl')
-                # partial_data = collect_ownership_data(os.path.join(unzipped, folder))
+                partial_data = collect_ownership_data(os.path.join(unzipped, folder))
                 with open(cur_pickle_path, "wb") as f:
-                    cloudpickle.dump({'a': 2}, f)
+                    cloudpickle.dump(partial_data, f)
                 shutil.rmtree(os.path.join(unzipped, folder), ignore_errors=True)
                 #data.extend(partial_data)
         with open(pickle_path, "rb") as f:
             data = cloudpickle.load(f)
 
         print(f"  time {datetime.datetime.now().strftime('%H:%M:%S')}")
-    #     shuffler.shuffle(data)
-    #     old_model = jax.tree_util.tree_map(jnp.copy, transfer_model)
-    #     transfer_model, losses = transfer_model.train(), []
-    #     # transfer_model.backbone = pax.freeze_parameters(transfer_model.backbone)
-    #     transfer_model, optim = jax.device_put_replicated((transfer_model, optim), devices)
-    #     ids = range(0, len(data) - training_batch_size, training_batch_size)
-    #     with click.progressbar(ids, label="  train model   ") as progressbar:
-    #         for idx in progressbar:
-    #             batch = data[idx: (idx + training_batch_size)]
-    #             batch = [TrainingOwnershipExample(state=d.state, move=d.move, mask=d.mask, board_mask=d.board_mask,
-    #                                               value=d.value) for d in batch]
-    #             batch = jax.tree_util.tree_map(_stack_and_reshape, *batch)
-    #             transfer_model, optim, loss = train_ownership_step(transfer_model, optim, batch)
-    #             losses.append(loss)
-    #
-    #     value_loss, policy_loss = zip(*losses)
-    #     value_loss = np.mean(sum(jax.device_get(loss))) / len(loss)
-    #     policy_loss = np.mean(sum(jax.device_get(policy_loss))) / len(policy_loss)
-    #     transfer_model, optim = jax.tree_util.tree_map(lambda x: x[0], (transfer_model, optim))
-    #
-    #     if iteration % 19 == 0:
-    #         transfer_model = transfer_model.eval()
-    #
-    #         accs = []
-    #         mses = []
-    #         ids = range(0, len(test_data) - training_batch_size, training_batch_size)
-    #         with click.progressbar(ids, label="  test model   ") as progressbar:
-    #             for idx in progressbar:
-    #                 batch = test_data[idx: (idx + training_batch_size)]
-    #                 # I needed to move axis
-    #                 batch = [TrainingOwnershipExample(state=d.state, move=d.move, mask=d.mask, board_mask=d.board_mask,
-    #                                                   value=d.value) for d in batch]
-    #                 # batch = jax.tree_util.tree_map(_stack_and_reshape, *batch)
-    #                 top_1_acc, mse = test_ownership(transfer_model, batch)
-    #                 accs.append(top_1_acc)
-    #                 mses.append(mse)
-    #
-    #         top_1_acc = np.mean(accs)
-    #         mse = np.mean(mses)
-    #
-    #         print(
-    #             f"  ownership loss {value_loss:.3f}"
-    #             f"  policy loss {policy_loss:.3f}"
-    #             f"  test top 1 accuracy {top_1_acc:.3f}"
-    #             f"  test ownership map MSE {mse:.3f}"
-    #             f"  learning rate {optim[1][-1].learning_rate:.1e}"
-    #             f"  time {datetime.datetime.now().strftime('%H:%M:%S')}"
-    #         )
-    #         # save agent's weights to disk
-    #         with open(os.path.join(root_dir, trained_ckpt_filename), "wb") as writer:
-    #             dic = {
-    #                 "agent": jax.device_get(transfer_model.state_dict()),
-    #                 "optim": jax.device_get(transfer_model.state_dict()),
-    #                 "iter": iteration,
-    #             }
-    #             pickle.dump(dic, writer)
-    # print("Done!")
+        shuffler.shuffle(data)
+        # old_model = jax.tree_util.tree_map(jnp.copy, transfer_model)
+        transfer_model, losses = transfer_model.train(), []
+        # transfer_model.backbone = pax.freeze_parameters(transfer_model.backbone)
+        transfer_model, optim = jax.device_put_replicated((transfer_model, optim), devices)
+        ids = range(0, len(data) - training_batch_size, training_batch_size)
+        with click.progressbar(ids, label="  train model   ") as progressbar:
+            for idx in progressbar:
+                batch = data[idx: (idx + training_batch_size)]
+                batch = [apply_random_flips(d) for d in batch]
+                batch = [construct_training_datapoint(d) for d in batch]
+                # batch = [TrainingOwnershipExample(state=d.state, move=d.move, mask=d.mask, board_mask=d.board_mask,
+                #                                   value=d.value) for d in batch]
+                batch = jax.tree_util.tree_map(_stack_and_reshape, *batch)
+                transfer_model, optim, loss = train_ownership_step(transfer_model, optim, batch)
+                losses.append(loss)
+
+        value_loss, policy_loss = zip(*losses)
+        value_loss = np.mean(sum(jax.device_get(loss))) / len(loss)
+        policy_loss = np.mean(sum(jax.device_get(policy_loss))) / len(policy_loss)
+        transfer_model, optim = jax.tree_util.tree_map(lambda x: x[0], (transfer_model, optim))
+
+        if iteration % 10 == 0:
+            transfer_model = transfer_model.eval()
+            # save agent's weights to disk
+            with open(trained_ckpt_path, "wb") as writer:
+                dic = {
+                    "agent": jax.device_get(transfer_model.state_dict()),
+                    "optim": jax.device_get(transfer_model.state_dict()),
+                    "iter": iteration,
+                }
+                pickle.dump(dic, writer)
+
+            accs = []
+            mses = []
+            ids = range(0, len(test_data) - training_batch_size, training_batch_size)
+            with click.progressbar(ids, label="  test model   ") as progressbar:
+                for idx in progressbar:
+                    batch = test_data[idx: (idx + training_batch_size)]
+                    # I needed to move axis
+                    batch = [#TrainingOwnershipExample(state=d.state, move=d.move, mask=d.mask, board_mask=d.board_mask,
+                             #                         value=d.value)
+                             construct_training_datapoint(d) for d in batch]
+                    # batch = jax.tree_util.tree_map(_stack_and_reshape, *batch)
+                    top_1_acc, mse = test_ownership(transfer_model, batch)
+                    accs.append(top_1_acc)
+                    mses.append(mse)
+
+            top_1_acc = np.mean(accs)
+            mse = np.mean(mses)
+
+            print(
+                f"  ownership loss {value_loss:.3f}"
+                f"  policy loss {policy_loss:.3f}"
+                f"  test top 1 accuracy {top_1_acc:.3f}"
+                f"  test ownership map MSE {mse:.3f}"
+                f"  learning rate {optim[1][-1].learning_rate:.1e}"
+                f"  time {datetime.datetime.now().strftime('%H:%M:%S')}"
+            )
+    print("Done!")
 
 
 """
