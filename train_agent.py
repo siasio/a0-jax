@@ -424,7 +424,7 @@ def ownership_loss_fn(net, data: TrainingOwnershipDatapoint):
     # action_logits_valid = action_logits[flat_mask]
 
     cross_entropy_loss = - jnp.sum(target_pr * log_action_logits, axis=-1)
-    cross_entropy_loss = jnp.mean(cross_entropy_loss)  # SF: is it a mean over a batch?
+    cross_entropy_loss = jnp.mean(cross_entropy_loss)
 
     # Penalty term for moves outside the mask
     action_logits_invalid = soft_action_logits * (1 - flat_mask)

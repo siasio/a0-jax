@@ -6,6 +6,7 @@ from typing import TypeVar, List
 
 T = TypeVar("T", bound="Module")
 
+
 class ResidualBlock(pax.Module):
     """A residual block of conv layers
 
@@ -160,7 +161,7 @@ class OwnershipHead(pax.Module):
         #    jax.nn.relu,
         #    pax.Conv2D(dim, 2 * num_outputs + 1, kernel_shape=1, padding="VALID"),
         #)
-        self.policy_head_old = pax.Sequential(
+        self.policy_head = pax.Sequential(
             #pax.Conv2D(dim, dim, kernel_shape=input_dims, padding="VALID"),
             #pax.BatchNorm2D(dim, True, True),
             #jax.nn.relu,
@@ -174,10 +175,14 @@ class OwnershipHead(pax.Module):
         action_logits = self.policy_head(x)
         ownership = self.ownership_head(x)
 
+        #if batched:
+        #    return action_logits[:, 0, 0, :], ownership[:, 0, 0, :]
+        #else:
+        #    return action_logits[0, 0, 0, :], ownership[0, 0, 0, :]
         if batched:
-            return action_logits[:, 0, 0, :], ownership[:, 0, 0, :]
+            return action_logits, ownership
         else:
-            return action_logits[0, 0, 0, :], ownership[0, 0, 0, :]
+            return action_logits[0, ...], ownership[0, ...]
 
 
 class TransferResnet(pax.Module):
