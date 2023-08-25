@@ -148,17 +148,26 @@ class OwnershipHead(pax.Module):
             pax.Conv2D(dim + 2, dim, 3),
             pax.BatchNorm2D(dim, True, True),
             jax.nn.relu,
-            pax.Conv2D(dim, num_outputs, kernel_shape=input_dims, padding="VALID"),
+            pax.Conv2D(dim, 1, 3),
             jnp.tanh,
         )
-        self.policy_head = pax.Sequential(
+        #self.policy_head_old = pax.Sequential(
+            # pax.Conv2D(dim, dim, kernel_shape=input_dims, padding="VALID"),
+            # pax.BatchNorm2D(dim, True, True),
+            # jax.nn.relu,
+        #    pax.Conv2D(dim + 2, dim, 3),
+        #    pax.BatchNorm2D(dim, True, True),
+        #    jax.nn.relu,
+        #    pax.Conv2D(dim, 2 * num_outputs + 1, kernel_shape=1, padding="VALID"),
+        #)
+        self.policy_head_old = pax.Sequential(
             #pax.Conv2D(dim, dim, kernel_shape=input_dims, padding="VALID"),
             #pax.BatchNorm2D(dim, True, True),
             #jax.nn.relu,
             pax.Conv2D(dim + 2, dim, 3),
             pax.BatchNorm2D(dim, True, True),
             jax.nn.relu,
-            pax.Conv2D(dim, 2 * num_outputs + 1, kernel_shape=1, padding="VALID"),
+            pax.Conv2D(dim, 2, 3),
         )
 
     def __call__(self, x, batched=False):
@@ -175,7 +184,7 @@ class TransferResnet(pax.Module):
     backbone: ResnetPolicyValueNet
     head: OwnershipHead
 
-    def __init__(self, backbone: ResnetPolicyValueNet, input_dims=(19, 19)):
+    def __init__(self, backbone: ResnetPolicyValueNet, head: OwnershipHead = None, input_dims=(19, 19)):
         super().__init__()
         # input_dims = backbone.input_dims
         if len(input_dims) == 3:
@@ -183,17 +192,20 @@ class TransferResnet(pax.Module):
             self.has_channel_dim = True
         else:
             self.has_channel_dim = False
-        self.backbone = backbone
-        dim = self.backbone.dim
+        self.module_dict = {}
+        self.module_dict["backbone"] = backbone
+        dim = self.module_dict["backbone"].dim
         self.num_intersections = input_dims[0] * input_dims[1]
-        self.head = OwnershipHead(dim=dim, input_dims=input_dims, num_outputs=self.num_intersections)
+        self.module_dict["head"] = OwnershipHead(dim=dim, input_dims=input_dims, num_outputs=self.num_intersections) if head is None else head
+
+    #parameters = pax.parameters_method("head", "backbone")
 
     def __call__(self, input: List[chex.Array], batched: bool = False):
         x, mask, board_mask = input
         x = x.astype(jnp.float32)
         mask = mask.astype(jnp.float32)
         board_mask = board_mask.astype(jnp.float32)
-        x = self.backbone(x, batched=batched)
+        x = self.module_dict["backbone"](x, batched=batched)
         mask = mask[..., None]
         if not batched:
             mask = mask[None]
@@ -202,7 +214,7 @@ class TransferResnet(pax.Module):
             board_mask = board_mask[None]
         x = jnp.concatenate((x, mask), axis=-1)
         x = jnp.concatenate((x, board_mask), axis=-1)
-        return self.head(x, batched=batched)
+        return self.module_dict["head"](x, batched=batched)
 
     #def train(self: T) -> T:
     #    self.apply(lambda mod: mod.replace(_training=True)) #super().train()

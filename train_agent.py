@@ -355,8 +355,10 @@ def apply_random_flips(d: TrainingOwnershipExample):
 #                           create_mask(params, lambda s: s.startswith('frozen')))
 
 def construct_move_target(has_next_move, coords, color):
+    target_pr = np.zeros([2 * 19 * 19])
     if has_next_move == 0:
-        move_loc = 2 * 19 * 19
+        pass
+        # move_loc = 2 * 19 * 19
     else:
         x, y = coords
         move_loc = 19 * x + y
@@ -364,19 +366,28 @@ def construct_move_target(has_next_move, coords, color):
         # If next move is Black (1), then current move is White (-1), and we add 361 to the index in the possible next move coordinates array
         if color == 1:
             move_loc += 19 * 19
-    target_pr = np.zeros([2 * 19 * 19 + 1])
-    target_pr[move_loc] = 1
+        target_pr[move_loc] = 1
     return target_pr
 
 
-def construct_flat_mask(data: TrainingOwnershipDatapoint):
-    def flatten_mask(mask_361):
-        single_flat = mask_361.reshape(mask_361.shape[0], -1)
-        full_flat = jnp.ones((single_flat.shape[0], 723), dtype=jnp.bool_)
-        full_flat = full_flat.at[..., :361].set(single_flat)
-        full_flat = full_flat.at[..., 361:722].set(single_flat)
-        return full_flat
+def flatten_mask(mask_361):
+    single_flat = mask_361.reshape(mask_361.shape[0], -1)
+    full_flat = jnp.ones((single_flat.shape[0], 722))
+    full_flat = full_flat.at[..., :361].set(single_flat)
+    full_flat = full_flat.at[..., 361:722].set(single_flat)
+    return full_flat
 
+
+def flatten_preds(preds_361):
+    first_flat = preds_361[..., 0].reshape(preds_361[..., 0].shape[0], -1)
+    full_flat = jnp.ones((first_flat.shape[0], 722))
+    full_flat = full_flat.at[..., :361].set(first_flat)
+    second_flat = preds_361[..., 1].reshape(preds_361[..., 1].shape[0], -1)
+    full_flat = full_flat.at[..., 361:722].set(second_flat)
+    return full_flat
+
+
+def construct_flat_mask(data: TrainingOwnershipDatapoint):
     allowed_moves_mask = (data.mask == 1) & (data.state[..., 7] == 0)
     return flatten_mask(allowed_moves_mask)
 
@@ -394,10 +405,13 @@ def ownership_loss_fn(net, data: TrainingOwnershipDatapoint):
     # to avoid log(0) = nan
     # target_pr = jnp.where(target_pr == 0, EPSILON, target_pr)
     flattened_ownership_mask = data.mask.reshape(data.mask.shape[0], -1)
-    mse_loss = optax.l2_loss(ownership_map * flattened_ownership_mask, data.value.reshape(data.value.shape[0], -1) * flattened_ownership_mask)
+    flattened_ownership_map = ownership_map.reshape(ownership_map.shape[0], -1)
+    mse_loss = optax.l2_loss(flattened_ownership_map * flattened_ownership_mask, data.value.reshape(data.value.shape[0], -1) * flattened_ownership_mask)
     mse_loss = jnp.mean(mse_loss)
 
     # policy loss (KL(target_policy', agent_policy))
+    action_logits = flatten_preds(action_logits)
+
     log_action_logits = jax.nn.log_softmax(action_logits, axis=-1)
     soft_action_logits = jax.nn.softmax(action_logits, axis=-1)
     # TODO: Is KL loss a good choice when my target is categorical (one-hot encoded) and not an array of probabilities?
@@ -438,7 +452,19 @@ def train_ownership_step(net, optim, data: TrainingOwnershipDatapoint):
     #data.state = net.backbone(data.state, data.mask, data.board_mask, batched=True)
     (_, (net, losses)), grads = jax.value_and_grad(ownership_loss_fn, has_aux=True)(net, data)
     grads = jax.lax.pmean(grads, axis_name="i")
+    #for name in grads.pytree_attributes:
+        #value = getattr(grads, name)
+        #value = jax.tree_util.tree_map(
+        #    _module_or_array,
+        #    value,
+        #    state_dict[name],
+        #    is_leaf=lambda x: isinstance(x, Module),
+        #)
+    #    setattr(grads, name, 0)
+    #grads = jax.tree_util.tree_map(lambda u, mt: u * , grads, multitransformer)
+    #net = pax.unfreeze_parameters(net)
     net, optim = opax.apply_gradients(net, optim, grads)
+    #net.freeze_parameters()
     return net, optim, losses
 
 
@@ -511,11 +537,13 @@ def train(
                 start_iter = 0 #dic["iter"] + 1
     else:
         start_iter = 0
+
     def lr_schedule(step):
         e = jnp.floor(step * 1.0 / lr_decay_steps)
         return learning_rate * jnp.exp2(-e)
 
     transfer_model = TransferResnet(agent)
+    #multitransformer = TransferResnet()
 
     if os.path.isfile(trained_ckpt_path):
         print('Loading trained weights at', trained_ckpt_filename)
@@ -617,6 +645,7 @@ def train(
         shuffler.shuffle(data)
         # old_model = jax.tree_util.tree_map(jnp.copy, transfer_model)
         transfer_model, losses = transfer_model.train(), []
+        # transfer_model.backbone = transfer_model.backbone.eval()
         # transfer_model.backbone = pax.freeze_parameters(transfer_model.backbone)
         transfer_model, optim = jax.device_put_replicated((transfer_model, optim), devices)
         ids = range(0, len(data) - training_batch_size, training_batch_size)
