@@ -355,7 +355,7 @@ def apply_random_flips(d: TrainingOwnershipExample):
 #                           create_mask(params, lambda s: s.startswith('frozen')))
 
 def construct_move_target(has_next_move, coords, color):
-    target_pr = np.zeros([2 * 19 * 19])
+    target_pr = jnp.zeros([2 * 19 * 19])
     if has_next_move == 0:
         pass
         # move_loc = 2 * 19 * 19
@@ -366,7 +366,7 @@ def construct_move_target(has_next_move, coords, color):
         # If next move is Black (1), then current move is White (-1), and we add 361 to the index in the possible next move coordinates array
         if color == 1:
             move_loc += 19 * 19
-        target_pr[move_loc] = 1
+        target_pr = target_pr.at[move_loc].set(1)
     return target_pr
 
 
@@ -474,7 +474,7 @@ def test_ownership(net, data: TrainingOwnershipDatapoint):
     """Evaluation on test set."""
     # SF: This if is redundant, it's not a list anyway, it's a dynamic jaxpr tracer - NO, IT'S NOT
     if isinstance(data, list):
-        #print('VERY UNEXPECTED IF USAGE')
+        # print('VERY UNEXPECTED IF USAGE')
         state = jnp.stack(list(d.state for d in data))
         mask = jnp.stack(list(d.mask for d in data))
         board_mask = jnp.stack(list(d.board_mask for d in data))
@@ -487,8 +487,11 @@ def test_ownership(net, data: TrainingOwnershipDatapoint):
         move = data.move
         value = data.value
     action_logits, ownership_map = net((state, mask, board_mask), batched=True)
+    action_logits = flatten_preds(action_logits)
     top_1_acc = (action_logits.argmax(axis=1) == move.argmax(axis=1)).mean()
-    mse_loss = optax.l2_loss(ownership_map * mask.reshape(mask.shape[0], -1), value.reshape(value.shape[0], -1) * mask.reshape(mask.shape[0], -1))
+    flattened_ownership_mask = mask.reshape(mask.shape[0], -1)
+    flattened_ownership_map = ownership_map.reshape(ownership_map.shape[0], -1)
+    mse_loss = optax.l2_loss(flattened_ownership_map * flattened_ownership_mask, value.reshape(value.shape[0], -1) * flattened_ownership_mask)
     return top_1_acc, mse_loss
 
 
