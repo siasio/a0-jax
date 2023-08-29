@@ -149,7 +149,7 @@ class OwnershipHead(pax.Module):
             pax.Conv2D(dim + 2, dim, 3),
             pax.BatchNorm2D(dim, True, True),
             jax.nn.relu,
-            pax.Conv2D(dim, 1, 3),
+            pax.Conv2D(dim, 1, 1, padding="VALID"),
             jnp.tanh,
         )
         #self.policy_head_old = pax.Sequential(
@@ -168,7 +168,7 @@ class OwnershipHead(pax.Module):
             pax.Conv2D(dim + 2, dim, 3),
             pax.BatchNorm2D(dim, True, True),
             jax.nn.relu,
-            pax.Conv2D(dim, 2, 3),
+            pax.Conv2D(dim, 2 * num_outputs + 1, kernel_shape=input_dims, padding="VALID"),
         )
 
     def __call__(self, x, batched=False):
@@ -180,9 +180,9 @@ class OwnershipHead(pax.Module):
         #else:
         #    return action_logits[0, 0, 0, :], ownership[0, 0, 0, :]
         if batched:
-            return action_logits, ownership
+            return jnp.squeeze(action_logits), jnp.squeeze(ownership)
         else:
-            return action_logits[0, ...], ownership[0, ...]
+            return jnp.squeeze(action_logits[0, ...]), jnp.squeeze(ownership[0, ...])
 
 
 class TransferResnet(pax.Module):

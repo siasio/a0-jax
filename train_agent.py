@@ -201,7 +201,6 @@ def collect_ownership_data(log_path):
 
 
 def apply_random_flips(d: TrainingOwnershipExample):
-    # TODO: add color flip?
     state, mask, board_mask, has_next_move, coords, value, color_to_move, next_color = d.state, d.mask, d.board_mask, d.has_next_move, d.next_move_coords, d.value, d.color_to_move, d.next_move_color
     if random.choice([0, 1]):
         state = state[:, ::-1, :]
@@ -229,11 +228,11 @@ def apply_random_flips(d: TrainingOwnershipExample):
 
 
 def construct_move_target(has_next_move, coords, color):
-    target_pr = jnp.zeros([2 * 19 * 19])
+    target_pr = jnp.zeros([2 * 19 * 19 + 1])
     if has_next_move == 0:
-        pass
-        # TODO: Add it back
-        # move_loc = 2 * 19 * 19
+        # pass
+        # DONETODO: Add it back
+        move_loc = 2 * 19 * 19
     else:
         x, y = coords
         move_loc = 19 * x + y
@@ -241,25 +240,27 @@ def construct_move_target(has_next_move, coords, color):
         # If next move is Black (1), then current move is White (-1), and we add 361 to the index in the possible next move coordinates array
         if color == 1:
             move_loc += 19 * 19
-        target_pr = target_pr.at[move_loc].set(1)
+    target_pr = target_pr.at[move_loc].set(1)
     return target_pr
 
 
 def flatten_mask(mask_361):
     single_flat = mask_361.reshape(mask_361.shape[0], -1)
-    full_flat = jnp.ones((single_flat.shape[0], 722))
+    full_flat = jnp.ones((single_flat.shape[0], 723))
     full_flat = full_flat.at[..., :361].set(single_flat)
     full_flat = full_flat.at[..., 361:722].set(single_flat)
     return full_flat
 
 
 def flatten_preds(preds_361):
-    first_flat = preds_361[..., 0].reshape(preds_361[..., 0].shape[0], -1)
-    full_flat = jnp.ones((first_flat.shape[0], 722))
-    full_flat = full_flat.at[..., :361].set(first_flat)
-    second_flat = preds_361[..., 1].reshape(preds_361[..., 1].shape[0], -1)
-    full_flat = full_flat.at[..., 361:722].set(second_flat)
-    return full_flat
+    if preds_361.shape[-1] == 2:
+        first_flat = preds_361[..., 0].reshape(preds_361[..., 0].shape[0], -1)
+        full_flat = jnp.ones((first_flat.shape[0], 722))
+        full_flat = full_flat.at[..., :361].set(first_flat)
+        second_flat = preds_361[..., 1].reshape(preds_361[..., 1].shape[0], -1)
+        full_flat = full_flat.at[..., 361:722].set(second_flat)
+        return full_flat
+    return preds_361
 
 
 def construct_flat_mask(data: TrainingOwnershipDatapoint):
@@ -314,23 +315,11 @@ def ownership_loss_fn(net, data: TrainingOwnershipDatapoint):
 @partial(jax.pmap, axis_name="i")
 def train_ownership_step(net, optim, data: TrainingOwnershipDatapoint):
     """A training step."""
-    # data.state = net.backbone(data.state, data.mask, data.board_mask, batched=True)
     (_, (net, losses)), grads = jax.value_and_grad(ownership_loss_fn, has_aux=True)(net, data)
     grads = jax.lax.pmean(grads, axis_name="i")
-    # for name in grads.pytree_attributes:
-    # value = getattr(grads, name)
-    # value = jax.tree_util.tree_map(
-    #    _module_or_array,
-    #    value,
-    #    state_dict[name],
-    #    is_leaf=lambda x: isinstance(x, Module),
-    # )
-    #    setattr(grads, name, 0)
-    # grads = jax.tree_util.tree_map(lambda u, mt: u * , grads, multitransformer)
-    # net = pax.unfreeze_parameters(net)
     net, optim = opax.apply_gradients(net, optim, grads)
-    # net.freeze_parameters()
     return net, optim, losses
+
 
 @partial(jax.pmap, axis_name="i")
 def test_ownership(net, data: TrainingOwnershipDatapoint):
@@ -397,7 +386,7 @@ def test_model(test_data, batch_size, model, optim, value_loss, policy_loss, _st
             # I needed to move axis
             batch = [construct_training_datapoint(d) for d in batch]
             batch = jax.tree_util.tree_map(_stack_and_reshape, *batch)
-            top_1_acc, mse = test_ownership(model, batch)
+            top_1_acc, mse = test_ownership(transfer_model, batch)
             accs.append(top_1_acc)
             mses.append(mse)
 
@@ -444,14 +433,14 @@ def train(
         agent_class="policies.resnet_policy.ResnetPolicyValueNet128",
         training_batch_size: int = 128,  # Originally 128 but maybe I'm getting OOM
         num_iterations: int = 20000,
-        learning_rate: float = 1e-3,  # Originally 0.01,
+        learning_rate: float = 1e-2,  # Originally 0.01,
         ckpt_filename: str = "go_agent_9x9_128_sym.ckpt",
         trained_ckpt_filename: str = "trained.ckpt",
         root_dir: str = ".",
         random_seed: int = 42,
         weight_decay: float = 1e-4,
-        lr_decay_steps: int = 200,  # My full epoch is likely shorter than 100_000 steps
-        backbone_lr_steps: int = 300,
+        lr_decay_steps: int = 10_000,  # My full epoch is likely shorter than 100_000 steps
+        backbone_lr_steps: int = 25_000,
 ):
     if root_dir == ".":
         root_dir = os.path.dirname(os.getcwd())
@@ -541,8 +530,7 @@ def train(
     for iteration in range(start_iter, num_iterations):
         print(f"Iteration {iteration}")
 
-        if iteration % 1 == 0:
-
+        if iteration % 20 == 0:
             test_model(test_data, training_batch_size, transfer_model, optim, value_loss, policy_loss, _stack_and_reshape, devices)
 
         pickle_path = os.path.join(root_dir, TRAIN_DIR, f'datasmall{iteration:04}.pkl')
@@ -550,8 +538,11 @@ def train(
             last_unpacked += 1
             zip_path = os.path.join(root_dir, TRAIN_DIR, f'{last_unpacked:04}.zip')
             if not os.path.exists(zip_path[:-4]):
-                with zipfile.ZipFile(zip_path, "r") as zip_ref:
-                    zip_ref.extractall(path=zip_path[:-4])
+                try:
+                    with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                        zip_ref.extractall(path=zip_path[:-4])
+                except:
+                    break
             unzipped = zip_path[:-4]
             for folder in os.listdir(unzipped):
                 small_counter += 1
@@ -583,9 +574,10 @@ def train(
         policy_loss = np.mean(sum(jax.device_get(policy_loss))) / len(policy_loss)
         transfer_model, optim = jax.tree_util.tree_map(lambda x: x[0], (transfer_model, optim))
 
-        if iteration % 10 == 0:
+        if iteration % 20 == 0:
             # save agent's weights to disk
             save_model(trained_ckpt_path, transfer_model, iteration)
+    save_model(trained_ckpt_path, transfer_model, num_iterations - 1)
 
     print("Done!")
 
