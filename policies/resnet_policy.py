@@ -186,8 +186,8 @@ class OwnershipHead(pax.Module):
 
 
 class TransferResnet(pax.Module):
-    backbone: ResnetPolicyValueNet
-    head: OwnershipHead
+    # backbone: ResnetPolicyValueNet
+    # head: OwnershipHead
 
     def __init__(self, backbone: ResnetPolicyValueNet, head: OwnershipHead = None, input_dims=(19, 19)):
         super().__init__()

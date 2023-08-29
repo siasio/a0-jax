@@ -11,7 +11,7 @@ import random
 import shutil
 import zipfile
 from functools import partial
-from typing import Optional
+from typing import Optional, Callable
 
 import chex
 import click
@@ -24,6 +24,7 @@ import numpy as np
 import opax
 import optax
 import pax
+from opax.transform import GradientTransformation
 
 from games.env import Enviroment
 from play import PlayResults, agent_vs_agent_multiple_games
@@ -38,20 +39,6 @@ EPSILON = 1e-9  # a very small positive value
 TRAIN_DIR = "zip_logs"
 TEST_DIR = "test_dir"
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = '.79'
-
-
-@chex.dataclass(frozen=True)
-class TrainingExample:
-    """AlphaZero training example.
-
-    state: the current state of the game.
-    action_weights: the target action probabilities from MCTS policy.
-    value: the target value from self-play result.
-    """
-
-    state: chex.Array
-    action_weights: chex.Array
-    value: chex.Array
 
 
 @chex.dataclass(frozen=True)
@@ -73,7 +60,6 @@ class TrainingOwnershipExample:
     mask: chex.Array
     board_mask: chex.Array
     value: chex.Array
-    # TODO: Think whether concatenating board mask to backbone output is the best solution
 
     @classmethod
     def from_obj(cls, obj: 'TrainingOwnershipExample', **kwargs):
@@ -125,54 +111,6 @@ class MoveOutput:
     action_weights: chex.Array
 
 
-@partial(jax.pmap, in_axes=(None, None, 0), static_broadcasted_argnums=(3, 4))
-def collect_batched_self_play_data(
-    agent,
-    env: Enviroment,
-    rng_key: chex.Array,
-    batch_size: int,
-    num_simulations_per_move: int,
-):
-    """Collect a batch of self-play data using mcts."""
-
-    def single_move(prev, inputs):
-        """Execute one self-play move using MCTS.
-
-        This function is designed to be compatible with jax.scan.
-        """
-        env, rng_key, step = prev
-        del inputs
-        rng_key, rng_key_next = jax.random.split(rng_key, 2)
-        state = jax.vmap(lambda e: e.canonical_observation())(env)
-        terminated = env.is_terminated()
-        policy_output = improve_policy_with_mcts(
-            agent,
-            env,
-            rng_key,
-            recurrent_fn,
-            num_simulations_per_move,
-        )
-        env, reward = jax.vmap(env_step)(env, policy_output.action)
-        return (env, rng_key_next, step + 1), MoveOutput(
-            state=state,
-            action_weights=policy_output.action_weights,
-            reward=reward,
-            terminated=terminated,
-        )
-
-    env = reset_env(env)
-    env = replicate(env, batch_size)
-    step = jnp.array(1)
-    _, self_play_data = pax.scan(
-        single_move,
-        (env, rng_key, step),
-        None,
-        length=env.max_num_steps(),
-        time_major=False,
-    )
-    return self_play_data
-
-
 def prepare_training_data(data: MoveOutput, env: Enviroment):
     """Preprocess the data collected from self-play.
 
@@ -207,39 +145,6 @@ def prepare_training_data(data: MoveOutput, env: Enviroment):
                 )
 
     return buffer
-
-
-def collect_self_play_data(
-    agent,
-    env,
-    rng_key: chex.Array,
-    batch_size: int,
-    data_size: int,
-    num_simulations_per_move: int,
-):
-    """Collect self-play data for training."""
-    num_iters = data_size // batch_size
-    devices = jax.local_devices()
-    num_devices = len(devices)
-    rng_key_list = jax.random.split(rng_key, num_iters * num_devices)
-    rng_keys = jnp.stack(rng_key_list).reshape((num_iters, num_devices, -1))  # type: ignore
-    data = []
-
-    with click.progressbar(range(num_iters), label="  self play     ") as bar:
-        for i in bar:
-            batch = collect_batched_self_play_data(
-                agent,
-                env,
-                rng_keys[i],
-                batch_size // num_devices,
-                num_simulations_per_move,
-            )
-            batch = jax.device_get(batch)
-            batch = jax.tree_util.tree_map(
-                lambda x: x.reshape((-1, *x.shape[2:])), batch
-            )
-            data.extend(prepare_training_data(batch, env=env))
-    return data
 
 
 def collect_ownership_data(log_path):
@@ -295,26 +200,6 @@ def collect_ownership_data(log_path):
     return data
 
 
-def loss_fn(net, data: TrainingExample):
-    """Sum of value loss and policy loss."""
-    net, (action_logits, value) = batched_policy(net, data.state)
-
-    # value loss (mse)
-    mse_loss = optax.l2_loss(value, data.value)
-    mse_loss = jnp.mean(mse_loss)
-
-    # policy loss (KL(target_policy', agent_policy))
-    target_pr = data.action_weights
-    # to avoid log(0) = nan
-    target_pr = jnp.where(target_pr == 0, EPSILON, target_pr)
-    action_logits = jax.nn.log_softmax(action_logits, axis=-1)
-    kl_loss = jnp.sum(target_pr * (jnp.log(target_pr) - action_logits), axis=-1)
-    kl_loss = jnp.mean(kl_loss)
-
-    # return the total loss
-    return mse_loss + kl_loss, (net, (mse_loss, kl_loss))
-
-
 def apply_random_flips(d: TrainingOwnershipExample):
     # TODO: add color flip?
     state, mask, board_mask, has_next_move, coords, value, color_to_move, next_color = d.state, d.mask, d.board_mask, d.has_next_move, d.next_move_coords, d.value, d.color_to_move, d.next_move_color
@@ -343,21 +228,11 @@ def apply_random_flips(d: TrainingOwnershipExample):
     return new_example  # TrainingOwnershipExample(state=state, mask=mask, board_mask=board_mask, next_move_coords=coords, value=value, color_to_move=color_to_move, next_color=next_color)
 
 
-#def zero_grads():
-#    # from https://github.com/deepmind/optax/issues/159#issuecomment-896459491
-#    def init_fn(_):
-#        return ()
-#    def update_fn(updates, state, params=None):
-#        return jax.tree_map(jnp.zeros_like, updates), ()
-#    return optax.GradientTransformation(init_fn, update_fn)
-
-#tx = optax.multi_transform({'adam': optax.adam(0.1), 'zero': zero_grads()},
-#                           create_mask(params, lambda s: s.startswith('frozen')))
-
 def construct_move_target(has_next_move, coords, color):
     target_pr = jnp.zeros([2 * 19 * 19])
     if has_next_move == 0:
         pass
+        # TODO: Add it back
         # move_loc = 2 * 19 * 19
     else:
         x, y = coords
@@ -406,7 +281,8 @@ def ownership_loss_fn(net, data: TrainingOwnershipDatapoint):
     # target_pr = jnp.where(target_pr == 0, EPSILON, target_pr)
     flattened_ownership_mask = data.mask.reshape(data.mask.shape[0], -1)
     flattened_ownership_map = ownership_map.reshape(ownership_map.shape[0], -1)
-    mse_loss = optax.l2_loss(flattened_ownership_map * flattened_ownership_mask, data.value.reshape(data.value.shape[0], -1) * flattened_ownership_mask)
+    mse_loss = optax.l2_loss(flattened_ownership_map * flattened_ownership_mask,
+                             data.value.reshape(data.value.shape[0], -1) * flattened_ownership_mask)
     mse_loss = jnp.mean(mse_loss)
 
     # policy loss (KL(target_policy', agent_policy))
@@ -414,8 +290,6 @@ def ownership_loss_fn(net, data: TrainingOwnershipDatapoint):
 
     log_action_logits = jax.nn.log_softmax(action_logits, axis=-1)
     soft_action_logits = jax.nn.softmax(action_logits, axis=-1)
-    # TODO: Is KL loss a good choice when my target is categorical (one-hot encoded) and not an array of probabilities?
-    #  ANSWER: No
 
     flat_mask = construct_flat_mask(data)
     penalty_weight = 2.
@@ -438,79 +312,146 @@ def ownership_loss_fn(net, data: TrainingOwnershipDatapoint):
 
 
 @partial(jax.pmap, axis_name="i")
-def train_step(net, optim, data: TrainingExample):
-    """A training step."""
-    (_, (net, losses)), grads = jax.value_and_grad(loss_fn, has_aux=True)(net, data)
-    grads = jax.lax.pmean(grads, axis_name="i")
-    net, optim = opax.apply_gradients(net, optim, grads)
-    return net, optim, losses
-
-
-@partial(jax.pmap, axis_name="i")
 def train_ownership_step(net, optim, data: TrainingOwnershipDatapoint):
     """A training step."""
-    #data.state = net.backbone(data.state, data.mask, data.board_mask, batched=True)
+    # data.state = net.backbone(data.state, data.mask, data.board_mask, batched=True)
     (_, (net, losses)), grads = jax.value_and_grad(ownership_loss_fn, has_aux=True)(net, data)
     grads = jax.lax.pmean(grads, axis_name="i")
-    #for name in grads.pytree_attributes:
-        #value = getattr(grads, name)
-        #value = jax.tree_util.tree_map(
-        #    _module_or_array,
-        #    value,
-        #    state_dict[name],
-        #    is_leaf=lambda x: isinstance(x, Module),
-        #)
+    # for name in grads.pytree_attributes:
+    # value = getattr(grads, name)
+    # value = jax.tree_util.tree_map(
+    #    _module_or_array,
+    #    value,
+    #    state_dict[name],
+    #    is_leaf=lambda x: isinstance(x, Module),
+    # )
     #    setattr(grads, name, 0)
-    #grads = jax.tree_util.tree_map(lambda u, mt: u * , grads, multitransformer)
-    #net = pax.unfreeze_parameters(net)
+    # grads = jax.tree_util.tree_map(lambda u, mt: u * , grads, multitransformer)
+    # net = pax.unfreeze_parameters(net)
     net, optim = opax.apply_gradients(net, optim, grads)
-    #net.freeze_parameters()
+    # net.freeze_parameters()
     return net, optim, losses
 
-
-#@partial(jax.pmap, axis_name="i")
+@partial(jax.pmap, axis_name="i")
 def test_ownership(net, data: TrainingOwnershipDatapoint):
-    # This function has outdated code
     """Evaluation on test set."""
-    # SF: This if is redundant, it's not a list anyway, it's a dynamic jaxpr tracer - NO, IT'S NOT
-    if isinstance(data, list):
-        # print('VERY UNEXPECTED IF USAGE')
-        state = jnp.stack(list(d.state for d in data))
-        mask = jnp.stack(list(d.mask for d in data))
-        board_mask = jnp.stack(list(d.board_mask for d in data))
-        move = jnp.stack(list(d.move for d in data))
-        value = jnp.stack(list(d.value for d in data))
-    else:
-        state = data.state
-        mask = data.mask
-        board_mask = data.board_mask
-        move = data.move
-        value = data.value
-    action_logits, ownership_map = net((state, mask, board_mask), batched=True)
-    action_logits = flatten_preds(action_logits)
-    top_1_acc = (action_logits.argmax(axis=1) == move.argmax(axis=1)).mean()
-    flattened_ownership_mask = mask.reshape(mask.shape[0], -1)
-    flattened_ownership_map = ownership_map.reshape(ownership_map.shape[0], -1)
-    mse_loss = optax.l2_loss(flattened_ownership_map * flattened_ownership_mask, value.reshape(value.shape[0], -1) * flattened_ownership_mask)
+    (top_1_acc, mse_loss), _ = jax.value_and_grad(calculate_metrics, has_aux=True)(net, data)
     return top_1_acc, mse_loss
+
+
+def calculate_metrics(net, data: TrainingOwnershipDatapoint):
+    net, (action_logits, ownership_map) = batched_policy(net, (data.state, data.mask, data.board_mask))
+
+    action_logits = flatten_preds(action_logits)
+    top_1_acc = (action_logits.argmax(axis=1) == data.move.argmax(axis=1)).mean()
+    flattened_ownership_mask = data.mask.reshape(data.mask.shape[0], -1)
+    flattened_ownership_map = ownership_map.reshape(ownership_map.shape[0], -1)
+    mse_loss = optax.l2_loss(flattened_ownership_map * flattened_ownership_mask,
+                             data.value.reshape(data.value.shape[0], -1) * flattened_ownership_mask)
+    return top_1_acc, mse_loss
+
+
+def multi_transform(schedule_fn: Callable[[jnp.ndarray], jnp.ndarray]):
+    count: jnp.ndarray
+    backbone_multiplier: jnp.ndarray
+
+    class MultiTransform(GradientTransformation):
+        def __init__(self, params):
+            super().__init__(params=params)
+            self.schedule_fn = schedule_fn
+            self.count = jnp.array(0, dtype=jnp.int32)
+            self.backbone_multiplier = self.schedule_fn(self.count)
+
+        def __call__(self, updates, params=None):
+            del params
+            self.count = self.count + 1
+            self.backbone_multiplier = self.schedule_fn(self.count)
+
+            updates = jax.tree_util.tree_map_with_path(
+                lambda path, u: self.backbone_multiplier * u if "backbone" in jax.tree_util.keystr(path) else u, updates
+            )
+            return updates
+
+    return MultiTransform
+
+
+def save_model(trained_ckpt_path, model, iteration):
+    with open(trained_ckpt_path, "wb") as writer:
+        dic = {
+            "agent": jax.device_get(model.state_dict()),
+            "optim": jax.device_get(model.state_dict()),
+            "iter": iteration,
+        }
+        pickle.dump(dic, writer)
+
+
+def test_model(test_data, batch_size, model, optim, value_loss, policy_loss, _stack_and_reshape, devices):
+    transfer_model = model.eval()
+    transfer_model, optim = jax.device_put_replicated((transfer_model, optim), devices)
+    accs = []
+    mses = []
+    ids = range(0, len(test_data) - batch_size, batch_size)
+    with click.progressbar(ids, label="  test model   ") as progressbar:
+        for idx in progressbar:
+            batch = test_data[idx: (idx + batch_size)]
+            # I needed to move axis
+            batch = [construct_training_datapoint(d) for d in batch]
+            batch = jax.tree_util.tree_map(_stack_and_reshape, *batch)
+            top_1_acc, mse = test_ownership(model, batch)
+            accs.append(top_1_acc)
+            mses.append(mse)
+
+    top_1_acc = np.mean(accs)
+    mse = np.mean(mses)
+
+    if value_loss is not None or policy_loss is not None:
+        text_to_print = f"  ownership loss {value_loss:.3f}  policy loss {policy_loss:.3f}"
+    else:
+        text_to_print = ""
+    print(text_to_print +
+          f"  test top 1 acc {top_1_acc:.3f}"
+          f"  test ownership MSE {mse:.3f}"
+          f"  learning rate {optim[1][-1].learning_rate[0]:.1e}"
+          f"  backbone multiplier {optim[2].backbone_multiplier[0]:.1f}"
+          f"  time {datetime.datetime.now().strftime('%H:%M:%S')}"
+          )
+
+
+def check_backbone(ckpt_path, trained_ckpt_path, agent):
+    print("Loading weights at", ckpt_path)
+    with open(ckpt_path, "rb") as f:
+        dic = pickle.load(f)
+        if "agent" in dic:
+            dic = dic["agent"]
+        agent = agent.load_state_dict(dic)
+    jax.tree_util.tree_map(lambda p: print(np.sum(p)), agent)
+    transfer_model = TransferResnet(agent)
+
+    if os.path.isfile(trained_ckpt_path):
+        print('Loading trained weights at', trained_ckpt_path)
+        with open(trained_ckpt_path, "rb") as f:
+            loaded_agent = pickle.load(f)
+            if "agent" in loaded_agent:
+                loaded_agent = loaded_agent["agent"]
+            transfer_model = transfer_model.load_state_dict(loaded_agent)
+
+    jax.tree_util.tree_map(lambda p: print(np.sum(p)), transfer_model.module_dict["backbone"])
 
 
 @pax.pure
 def train(
-    game_class="games.go_game.GoBoard9x9",
-    agent_class="policies.resnet_policy.ResnetPolicyValueNet128",
-    selfplay_batch_size: int = 128,
-    training_batch_size: int = 128,  # Originally 128 but maybe I'm getting OOM
-    num_iterations: int = 20000,
-    num_simulations_per_move: int = 32,
-    num_self_plays_per_iteration: int = 128 * 100,
-    learning_rate: float = 1e-3,  # Originally 0.01,
-    ckpt_filename: str = "go_agent_9x9_128_sym.ckpt",
-    trained_ckpt_filename: str = "trained.ckpt",
-    root_dir: str = ".",
-    random_seed: int = 42,
-    weight_decay: float = 1e-4,
-    lr_decay_steps: int = 100_000,
+        game_class="games.go_game.GoBoard9x9",
+        agent_class="policies.resnet_policy.ResnetPolicyValueNet128",
+        training_batch_size: int = 128,  # Originally 128 but maybe I'm getting OOM
+        num_iterations: int = 20000,
+        learning_rate: float = 1e-3,  # Originally 0.01,
+        ckpt_filename: str = "go_agent_9x9_128_sym.ckpt",
+        trained_ckpt_filename: str = "trained.ckpt",
+        root_dir: str = ".",
+        random_seed: int = 42,
+        weight_decay: float = 1e-4,
+        lr_decay_steps: int = 200,  # My full epoch is likely shorter than 100_000 steps
+        backbone_lr_steps: int = 300,
 ):
     if root_dir == ".":
         root_dir = os.path.dirname(os.getcwd())
@@ -525,42 +466,39 @@ def train(
     # STAS-08: moved the following lines loading weights before transfer_model definition
     ckpt_path = os.path.join(root_dir, ckpt_filename)
     trained_ckpt_path = os.path.join(root_dir, trained_ckpt_filename)
-    if os.path.isfile(ckpt_path):
-        if os.path.isfile(trained_ckpt_path):
-            agent = ResnetPolicyValueNet128(input_dims=(9, 9, 9), num_actions=82)
-            start_iter = 0  # TODO: it should be different
-        else:
-            print("Loading weights at", ckpt_filename)
-            with open(ckpt_path, "rb") as f:
-                dic = pickle.load(f)
-                if "agent" in dic:
-                    dic = dic["agent"]
-                agent = agent.load_state_dict(dic)
-                #optim = optim.load_state_dict(dic["optim"])
-                start_iter = 0 #dic["iter"] + 1
-    else:
-        start_iter = 0
+    # check_backbone(ckpt_path, trained_ckpt_path, agent)
+    # input("What now?")
+    start_iter = 1
+    if os.path.isfile(ckpt_path) and not os.path.isfile(trained_ckpt_path):
+        print("Loading weights at", ckpt_filename)
+        with open(ckpt_path, "rb") as f:
+            dic = pickle.load(f)
+            if "agent" in dic:
+                dic = dic["agent"]
+            agent = agent.load_state_dict(dic)
 
     def lr_schedule(step):
         e = jnp.floor(step * 1.0 / lr_decay_steps)
         return learning_rate * jnp.exp2(-e)
 
+    def lr_backbone_schedule(step):
+        return step > backbone_lr_steps
+
     transfer_model = TransferResnet(agent)
-    #multitransformer = TransferResnet()
+
+    optim = opax.chain(
+        opax.add_decayed_weights(weight_decay),
+        opax.sgd(lr_schedule, momentum=0.9),
+        multi_transform(lr_backbone_schedule)
+    ).init(transfer_model.parameters())
 
     if os.path.isfile(trained_ckpt_path):
         print('Loading trained weights at', trained_ckpt_filename)
         with open(trained_ckpt_path, "rb") as f:
             loaded_agent = pickle.load(f)
-            if "agent" in loaded_agent:
-                loaded_agent = loaded_agent["agent"]
-            transfer_model = transfer_model.load_state_dict(loaded_agent)
-
-    optim = opax.chain(
-        opax.add_decayed_weights(weight_decay),
-        opax.sgd(lr_schedule, momentum=0.9),
-    ).init(transfer_model.parameters())
-
+            start_iter = loaded_agent["iter"] + 1
+            optim = optim.load_state_dict(loaded_agent["optim"])
+            transfer_model = transfer_model.load_state_dict(loaded_agent["agent"])
 
 
     rng_key = jax.random.PRNGKey(random_seed)
@@ -584,47 +522,29 @@ def train(
         with open(pickle_test_path, "wb") as f:
             cloudpickle.dump(test_data, f)
 
-    # transfer_model = transfer_model.eval()
-    #
-    #
-    # accs = []
-    # mses = []
-    # ids = range(0, len(test_data) - training_batch_size, training_batch_size)
-    # with click.progressbar(ids, label="  test model   ") as progressbar:
-    #     for idx in progressbar:
-    #         batch = test_data[idx: (idx + training_batch_size)]
-    #         batch = [TrainingOwnershipExample(state=d.state, move=d.move, mask=d.mask, board_mask=d.board_mask,
-    #                                           value=d.value) for d in batch]
-    #         # batch = jax.tree_util.tree_map(_stack_and_reshape, *batch)
-    #         top_1_acc, mse = test_ownership(transfer_model, batch)
-    #         accs.append(top_1_acc)
-    #         mses.append(mse)
-    #
-    # top_1_acc = np.mean(accs)
-    # mse = np.mean(mses)
-    #
-    # print(
-    #     f"  test top 1 accuracy {top_1_acc:.3f}"
-    #     f"  test ownership map MSE {mse:.3f}"
-    #     f"  time {datetime.datetime.now().strftime('%H:%M:%S')}"
-    # )
-
-    already_pickled = [int(filename[9:-4]) for filename in os.listdir(os.path.join(root_dir, TRAIN_DIR)) if filename.endswith('.pkl')]
+    already_pickled = [int(filename[9:-4]) for filename in os.listdir(os.path.join(root_dir, TRAIN_DIR)) if
+                       filename.endswith('.pkl')]
     try:
         small_counter = max(already_pickled)
     except ValueError:
         small_counter = 0
-    start_iter += 1
-    num_iterations += 1
-    unpacked = [int(filename) for filename in os.listdir(os.path.join(root_dir, TRAIN_DIR)) if os.path.isdir(os.path.join(root_dir, TRAIN_DIR, filename))]
+    unpacked = [int(filename) for filename in os.listdir(os.path.join(root_dir, TRAIN_DIR)) if
+                os.path.isdir(os.path.join(root_dir, TRAIN_DIR, filename))]
     try:
         last_unpacked = max(unpacked)
     except ValueError:
         last_unpacked = 0
     print(f"Unpacked: {unpacked}")
 
+    value_loss, policy_loss = None, None
+
     for iteration in range(start_iter, num_iterations):
         print(f"Iteration {iteration}")
+
+        if iteration % 1 == 0:
+
+            test_model(test_data, training_batch_size, transfer_model, optim, value_loss, policy_loss, _stack_and_reshape, devices)
+
         pickle_path = os.path.join(root_dir, TRAIN_DIR, f'datasmall{iteration:04}.pkl')
         if not os.path.isfile(pickle_path):
             last_unpacked += 1
@@ -640,16 +560,13 @@ def train(
                 with open(cur_pickle_path, "wb") as f:
                     cloudpickle.dump(partial_data, f)
                 shutil.rmtree(os.path.join(unzipped, folder), ignore_errors=True)
-                #data.extend(partial_data)
+                # data.extend(partial_data)
         with open(pickle_path, "rb") as f:
             data = cloudpickle.load(f)
 
         print(f"  time {datetime.datetime.now().strftime('%H:%M:%S')}")
         shuffler.shuffle(data)
-        # old_model = jax.tree_util.tree_map(jnp.copy, transfer_model)
         transfer_model, losses = transfer_model.train(), []
-        # transfer_model.backbone = transfer_model.backbone.eval()
-        # transfer_model.backbone = pax.freeze_parameters(transfer_model.backbone)
         transfer_model, optim = jax.device_put_replicated((transfer_model, optim), devices)
         ids = range(0, len(data) - training_batch_size, training_batch_size)
         with click.progressbar(ids, label="  train model   ") as progressbar:
@@ -657,8 +574,6 @@ def train(
                 batch = data[idx: (idx + training_batch_size)]
                 batch = [apply_random_flips(d) for d in batch]
                 batch = [construct_training_datapoint(d) for d in batch]
-                # batch = [TrainingOwnershipExample(state=d.state, move=d.move, mask=d.mask, board_mask=d.board_mask,
-                #                                   value=d.value) for d in batch]
                 batch = jax.tree_util.tree_map(_stack_and_reshape, *batch)
                 transfer_model, optim, loss = train_ownership_step(transfer_model, optim, batch)
                 losses.append(loss)
@@ -669,42 +584,9 @@ def train(
         transfer_model, optim = jax.tree_util.tree_map(lambda x: x[0], (transfer_model, optim))
 
         if iteration % 10 == 0:
-            transfer_model = transfer_model.eval()
             # save agent's weights to disk
-            with open(trained_ckpt_path, "wb") as writer:
-                dic = {
-                    "agent": jax.device_get(transfer_model.state_dict()),
-                    "optim": jax.device_get(transfer_model.state_dict()),
-                    "iter": iteration,
-                }
-                pickle.dump(dic, writer)
+            save_model(trained_ckpt_path, transfer_model, iteration)
 
-            accs = []
-            mses = []
-            ids = range(0, len(test_data) - training_batch_size, training_batch_size)
-            with click.progressbar(ids, label="  test model   ") as progressbar:
-                for idx in progressbar:
-                    batch = test_data[idx: (idx + training_batch_size)]
-                    # I needed to move axis
-                    batch = [#TrainingOwnershipExample(state=d.state, move=d.move, mask=d.mask, board_mask=d.board_mask,
-                             #                         value=d.value)
-                             construct_training_datapoint(d) for d in batch]
-                    # batch = jax.tree_util.tree_map(_stack_and_reshape, *batch)
-                    top_1_acc, mse = test_ownership(transfer_model, batch)
-                    accs.append(top_1_acc)
-                    mses.append(mse)
-
-            top_1_acc = np.mean(accs)
-            mse = np.mean(mses)
-
-            print(
-                f"  ownership loss {value_loss:.3f}"
-                f"  policy loss {policy_loss:.3f}"
-                f"  test top 1 accuracy {top_1_acc:.3f}"
-                f"  test ownership map MSE {mse:.3f}"
-                f"  learning rate {optim[1][-1].learning_rate:.1e}"
-                f"  time {datetime.datetime.now().strftime('%H:%M:%S')}"
-            )
     print("Done!")
 
 
@@ -776,7 +658,6 @@ def train(
             pickle.dump(dic, writer)
     print("Done!")
 """
-
 
 if __name__ == "__main__":
     if "COLAB_TPU_ADDR" in os.environ:
