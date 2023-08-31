@@ -62,9 +62,28 @@ def select_tree(pred: jnp.ndarray, a, b):
     return jax.tree_util.tree_map(partial(jax.lax.select, pred), a, b)
 
 
+num_recent_positions = 8
+
+
 def stack_last_state(state: jnp.ndarray):
-    num_recent_positions = 8
-    #state = state[None]
     stacked = jnp.stack([state] * num_recent_positions)
     stacked = jnp.concatenate((stacked, jnp.zeros_like(state)[None]))
     return jnp.moveaxis(stacked, 0, -1)
+
+
+def add_new_state(stacked_pos: jnp.ndarray, state: jnp.ndarray, color_to_play: int):
+    moved_axis = jnp.moveaxis(stacked_pos, -1, 0)
+    new_stacked_pos = jnp.concatenate((moved_axis[1:-1], state[None]))
+    new_stacked_pos = jnp.concatenate((new_stacked_pos, jnp.ones_like(state)[None]))
+    # TODO: Understand these multiplications
+    new_stacked_pos = new_stacked_pos * color_to_play
+    return jnp.moveaxis(new_stacked_pos, 0, -1)
+
+
+def add_new_stack_previous_state(stacked_pos: jnp.ndarray, state: jnp.ndarray, color_to_play: int):
+    moved_axis = jnp.moveaxis(stacked_pos, -1, 0)
+    previous_state = jnp.stack([moved_axis[-2]] * (num_recent_positions - 1))
+    new_stacked_pos = jnp.concatenate((previous_state, state[None]))
+    new_stacked_pos = jnp.concatenate((new_stacked_pos, jnp.ones_like(state)[None]))
+    new_stacked_pos = new_stacked_pos * color_to_play
+    return jnp.moveaxis(new_stacked_pos, 0, -1)
