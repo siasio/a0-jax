@@ -72,19 +72,19 @@ def stack_last_state(state: np.ndarray):
     return np.moveaxis(stacked, 0, -1)
 
 
-def add_new_state(stacked_pos: np.ndarray, state: jnp.ndarray, color_to_play: int):
+def add_new_state(stacked_pos: np.ndarray, state: np.ndarray):
     moved_axis = np.moveaxis(stacked_pos, -1, 0)
     new_stacked_pos = np.concatenate((moved_axis[1:-1], state[None]))
     new_stacked_pos = np.concatenate((new_stacked_pos, np.ones_like(state)[None]))
     # TODO: Understand these multiplications
-    new_stacked_pos = new_stacked_pos * color_to_play
+    # new_stacked_pos = new_stacked_pos * color_to_play
     return np.moveaxis(new_stacked_pos, 0, -1)
 
 
-def add_new_stack_previous_state(stacked_pos: np.ndarray, state: np.ndarray, color_to_play: int):
+def add_new_stack_previous_state(stacked_pos: np.ndarray, state: np.ndarray):
     moved_axis = np.moveaxis(stacked_pos, -1, 0)
     previous_state = np.stack([moved_axis[-2]] * (num_recent_positions - 1))
     new_stacked_pos = np.concatenate((previous_state, state[None]))
     new_stacked_pos = np.concatenate((new_stacked_pos, np.ones_like(state)[None]))
-    new_stacked_pos = new_stacked_pos * color_to_play
+    # new_stacked_pos = new_stacked_pos * color_to_play
     return np.moveaxis(new_stacked_pos, 0, -1)
