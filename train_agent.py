@@ -186,7 +186,7 @@ def collect_ownership_data(log_path):
 
                         state = jnp.moveaxis(jnp.array(position_list), 0, -1)
 
-                        # value = jnp.array(a0pos.continous_ownership)  # .flatten()
+                        # value = jnp.array(a0pos.continuous_ownership)  # .flatten()
                         example = TrainingOwnershipExample(state=state,
                                                            has_next_move=jnp.array(has_next_move),
                                                            next_move_color=jnp.array(color),
