@@ -95,58 +95,6 @@ class TrainingOwnershipDatapoint:
         return cls(**updated_fields)  # type : ignore - why does it not work?
 
 
-@chex.dataclass(frozen=True)
-class MoveOutput:
-    """The output of a single self-play move.
-
-    state: the current state of game.
-    reward: the reward after execute the action from MCTS policy.
-    terminated: the current state is a terminated state (bad state).
-    action_weights: the action probabilities from MCTS policy.
-    """
-
-    state: chex.Array
-    reward: chex.Array
-    terminated: chex.Array
-    action_weights: chex.Array
-
-
-def prepare_training_data(data: MoveOutput, env: Enviroment):
-    """Preprocess the data collected from self-play.
-
-    1. remove states after the enviroment is terminated.
-    2. compute the value at each state.
-    """
-    buffer = []
-    num_games = len(data.terminated)
-    for i in range(num_games):
-        state = data.state[i]
-        is_terminated = data.terminated[i]
-        action_weights = data.action_weights[i]
-        reward = data.reward[i]
-        num_steps = len(is_terminated)
-        value: Optional[chex.Array] = None
-        for idx in reversed(range(num_steps)):
-            if is_terminated[idx]:
-                continue
-            if value is None:
-                value = reward[idx]
-            else:
-                value = -value
-            s = np.copy(state[idx])
-            a = np.copy(action_weights[idx])
-            for augmented_s, augmented_a in env.symmetries(s, a):
-                buffer.append(
-                    TrainingExample(  # type: ignore
-                        state=augmented_s,
-                        action_weights=augmented_a,
-                        value=np.array(value, dtype=np.float32),
-                    )
-                )
-
-    return buffer
-
-
 def collect_ownership_data(log_path):
     def get_position(gtp_row) -> AnalyzedPosition:
         try:
@@ -230,8 +178,6 @@ def apply_random_flips(d: TrainingOwnershipExample):
 def construct_move_target(has_next_move, coords, color):
     target_pr = jnp.zeros([2 * 19 * 19 + 1])
     if has_next_move == 0:
-        # pass
-        # DONETODO: Add it back
         move_loc = 2 * 19 * 19
     else:
         x, y = coords
@@ -295,9 +241,6 @@ def ownership_loss_fn(net, data: TrainingOwnershipDatapoint):
     flat_mask = construct_flat_mask(data)
     penalty_weight = 2.
 
-    # target_pr_valid = target_pr[flat_mask]
-    # action_logits_valid = action_logits[flat_mask]
-
     cross_entropy_loss = - jnp.sum(target_pr * log_action_logits, axis=-1)
     cross_entropy_loss = jnp.mean(cross_entropy_loss)
 
@@ -341,6 +284,10 @@ def calculate_metrics(net, data: TrainingOwnershipDatapoint):
 
 
 def multi_transform(schedule_fn: Callable[[jnp.ndarray], jnp.ndarray]):
+    """
+    Freeze backbone weights in the beginning of training
+    """
+
     count: jnp.ndarray
     backbone_multiplier: jnp.ndarray
 
@@ -407,6 +354,9 @@ def test_model(test_data, batch_size, model, optim, value_loss, policy_loss, _st
 
 
 def check_backbone(ckpt_path, trained_ckpt_path, agent):
+    """
+    Simple utility to check if the backbone weights were indeed frozen
+    """
     print("Loading weights at", ckpt_path)
     with open(ckpt_path, "rb") as f:
         dic = pickle.load(f)
@@ -435,7 +385,7 @@ def train(
         num_iterations: int = 20000,
         learning_rate: float = 1e-2,  # Originally 0.01,
         ckpt_filename: str = "go_agent_9x9_128_sym.ckpt",
-        trained_ckpt_filename: str = "trained.ckpt",
+        trained_ckpt_filename: str = "trained_2023-08.ckpt",
         root_dir: str = ".",
         random_seed: int = 42,
         weight_decay: float = 1e-4,
@@ -456,7 +406,7 @@ def train(
     ckpt_path = os.path.join(root_dir, ckpt_filename)
     trained_ckpt_path = os.path.join(root_dir, trained_ckpt_filename)
     # check_backbone(ckpt_path, trained_ckpt_path, agent)
-    # input("What now?")
+    # return
     start_iter = 1
     if os.path.isfile(ckpt_path) and not os.path.isfile(trained_ckpt_path):
         print("Loading weights at", ckpt_filename)
