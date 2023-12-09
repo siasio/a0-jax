@@ -95,7 +95,7 @@ class TrainingOwnershipDatapoint:
         return cls(**updated_fields)  # type : ignore - why does it not work?
 
 
-def collect_ownership_data(log_path):
+def collect_ownership_data(log_path, use_only_19x19=True):
     def get_position(gtp_row) -> AnalyzedPosition:
         try:
             a0position = AnalyzedPosition.from_gtp_log(gtp_data=gtp_row)
@@ -114,6 +114,8 @@ def collect_ownership_data(log_path):
                 gtp_games = f.read().splitlines()
                 for gtp_game in gtp_games:
                     a0pos = get_position(json.loads(gtp_game))
+                    if use_only_19x19 and (a0pos.size_x != 19 or a0pos.size_y != 19):
+                        continue
                     if a0pos is None:
                         print(f'Bad log found in {file}: {gtp_game}')
                         continue
@@ -344,13 +346,16 @@ def test_model(test_data, batch_size, model, optim, value_loss, policy_loss, _st
         text_to_print = f"  ownership loss {value_loss:.3f}  policy loss {policy_loss:.3f}"
     else:
         text_to_print = ""
+    lr = optim[1][-1].learning_rate[0]
+    backbone_multiplier = optim[2].backbone_multiplier[0]
     print(text_to_print +
           f"  test top 1 acc {top_1_acc:.3f}"
-          f"  test ownership MSE {mse:.3f}"
-          f"  learning rate {optim[1][-1].learning_rate[0]:.1e}"
-          f"  backbone multiplier {optim[2].backbone_multiplier[0]:.1f}"
+          f"  test ownership MSE {mse:.4f}"
+          f"  learning rate {lr:.1e}"
+          f"  backbone multiplier {backbone_multiplier:.1f}"
           f"  time {datetime.datetime.now().strftime('%H:%M:%S')}"
           )
+    return value_loss, policy_loss, top_1_acc, mse, lr, backbone_multiplier
 
 
 def check_backbone(ckpt_path, trained_ckpt_path, agent):
@@ -382,15 +387,16 @@ def train(
         game_class="games.go_game.GoBoard9x9",
         agent_class="policies.resnet_policy.ResnetPolicyValueNet128",
         training_batch_size: int = 128,  # Originally 128 but maybe I'm getting OOM
-        num_iterations: int = 20000,
+        num_iterations: int = 361,
         learning_rate: float = 1e-2,  # Originally 0.01,
         ckpt_filename: str = "go_agent_9x9_128_sym.ckpt",
-        trained_ckpt_filename: str = "trained_2023-08.ckpt",
+        trained_ckpt_filename: str = "trained_2023-12-frozen.ckpt",
         root_dir: str = ".",
         random_seed: int = 42,
         weight_decay: float = 1e-4,
         lr_decay_steps: int = 10_000,  # My full epoch is likely shorter than 100_000 steps
-        backbone_lr_steps: int = 25_000,
+        backbone_lr_steps: int = 150_000,  # was 25_000 in August
+        use_only_19x19: bool = True,
 ):
     if root_dir == ".":
         root_dir = os.path.dirname(os.getcwd())
@@ -423,7 +429,7 @@ def train(
     def lr_backbone_schedule(step):
         return step > backbone_lr_steps
 
-    transfer_model = TransferResnet(agent)
+    transfer_model = TransferResnet(agent, include_boardmask=not use_only_19x19)
 
     optim = opax.chain(
         opax.add_decayed_weights(weight_decay),
@@ -457,7 +463,7 @@ def train(
         with open(pickle_test_path, "rb") as f:
             test_data = cloudpickle.load(f)
     else:
-        test_data = collect_ownership_data(os.path.join(root_dir, TEST_DIR))
+        test_data = collect_ownership_data(os.path.join(root_dir, TEST_DIR), use_only_19x19=use_only_19x19)
         with open(pickle_test_path, "wb") as f:
             cloudpickle.dump(test_data, f)
 
@@ -477,12 +483,20 @@ def train(
 
     value_loss, policy_loss = None, None
 
+    v_losses, p_losses, t1_accs, mses, lrs, bms, indices = [], [], [], [], [], [], []
+
     for iteration in range(start_iter, num_iterations):
         print(f"Iteration {iteration}")
 
-        if iteration % 20 == 0:
-            test_model(test_data, training_batch_size, transfer_model, optim, value_loss, policy_loss, _stack_and_reshape, devices)
-
+        if iteration % 20 == 1 or iteration in (6, 11, 16, 360):
+            value_loss, policy_loss, top_1_acc, mse, lr, backbone_multiplier = test_model(test_data, training_batch_size, transfer_model, optim, value_loss, policy_loss, _stack_and_reshape, devices)
+            v_losses.append(value_loss)
+            p_losses.append(policy_loss)
+            t1_accs.append(top_1_acc)
+            mses.append(mse)
+            lrs.append(lr)
+            bms.append(backbone_multiplier)
+            indices.append(iteration)
         pickle_path = os.path.join(root_dir, TRAIN_DIR, f'datasmall{iteration:04}.pkl')
         if not os.path.isfile(pickle_path):
             last_unpacked += 1
@@ -497,7 +511,7 @@ def train(
             for folder in os.listdir(unzipped):
                 small_counter += 1
                 cur_pickle_path = os.path.join(root_dir, TRAIN_DIR, f'datasmall{small_counter:04}.pkl')
-                partial_data = collect_ownership_data(os.path.join(unzipped, folder))
+                partial_data = collect_ownership_data(os.path.join(unzipped, folder), use_only_19x19=use_only_19x19)
                 with open(cur_pickle_path, "wb") as f:
                     cloudpickle.dump(partial_data, f)
                 shutil.rmtree(os.path.join(unzipped, folder), ignore_errors=True)
@@ -524,10 +538,28 @@ def train(
         policy_loss = np.mean(sum(jax.device_get(policy_loss))) / len(policy_loss)
         transfer_model, optim = jax.tree_util.tree_map(lambda x: x[0], (transfer_model, optim))
 
-        if iteration % 20 == 0:
+        if iteration % 20 == 1:
             # save agent's weights to disk
             save_model(trained_ckpt_path, transfer_model, iteration)
     save_model(trained_ckpt_path, transfer_model, num_iterations - 1)
+    # Plot metrics
+    import matplotlib.pyplot as plt
+    plt.plot(v_losses)
+    plt.plot(p_losses)
+    plt.plot(t1_accs)
+    plt.plot([None] + [mse * 1000 for mse in mses])
+    plt.plot([lr * 100 for lr in lrs])
+    plt.plot(bms)
+    plt.xticks(indices)
+    plt.legend(['Value loss', 'Policy loss', 'Top 1 accuracy', 'MSE * 1000', 'Learning rate * 100', 'Backbone multiplier'])
+    plt.savefig(os.path.join(root_dir, 'metrics-frozen.png'))
+    # print the list of floats with only 3 decimals
+    print("Value losses:", ", ".join([f"{v_loss:.3f}" for v_loss in v_losses if v_loss is not None]))
+    print("Policy losses:", ", ".join([f"{p_loss:.3f}" for p_loss in p_losses if p_loss is not None]))
+    print("Top 1 accuracies:", ", ".join([f"{t1_acc:.3f}" for t1_acc in t1_accs if t1_acc is not None]))
+    print("MSEs:", ", ".join([f"{mse:.3f}" for mse in mses if mse is not None]))
+    print("Learning rates:", ", ".join([f"{lr:.3f}" for lr in lrs if lr is not None]))
+    print("Backbone multipliers:", ", ".join([f"{bm:.3f}" for bm in bms if bm is not None]))
 
     print("Done!")
 

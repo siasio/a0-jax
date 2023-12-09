@@ -142,11 +142,12 @@ class OwnershipHeadShared(pax.Module):
 
 
 class OwnershipHead(pax.Module):
-    def __init__(self, dim, input_dims, num_outputs):
+    def __init__(self, dim, input_dims, num_outputs, include_boardmask=False):
         super().__init__()
         # Input is last layer of the ResNet concatenated with a mask
+        initial_dim = dim + 2 if include_boardmask else dim + 1
         self.ownership_head = pax.Sequential(
-            pax.Conv2D(dim + 2, dim, 3),
+            pax.Conv2D(initial_dim, dim, 3),
             pax.BatchNorm2D(dim, True, True),
             jax.nn.relu,
             pax.Conv2D(dim, 1, 1, padding="VALID"),
@@ -165,7 +166,7 @@ class OwnershipHead(pax.Module):
             #pax.Conv2D(dim, dim, kernel_shape=input_dims, padding="VALID"),
             #pax.BatchNorm2D(dim, True, True),
             #jax.nn.relu,
-            pax.Conv2D(dim + 2, dim, 3),
+            pax.Conv2D(initial_dim, dim, 3),
             pax.BatchNorm2D(dim, True, True),
             jax.nn.relu,
             pax.Conv2D(dim, 2 * num_outputs + 1, kernel_shape=input_dims, padding="VALID"),
@@ -189,7 +190,7 @@ class TransferResnet(pax.Module):
     # backbone: ResnetPolicyValueNet
     # head: OwnershipHead
 
-    def __init__(self, backbone: ResnetPolicyValueNet, head: OwnershipHead = None, input_dims=(19, 19)):
+    def __init__(self, backbone: ResnetPolicyValueNet, head: OwnershipHead = None, input_dims=(19, 19), include_boardmask=False):
         super().__init__()
         # input_dims = backbone.input_dims
         if len(input_dims) == 3:
@@ -201,7 +202,8 @@ class TransferResnet(pax.Module):
         self.module_dict["backbone"] = backbone
         dim = self.module_dict["backbone"].dim
         self.num_intersections = input_dims[0] * input_dims[1]
-        self.module_dict["head"] = OwnershipHead(dim=dim, input_dims=input_dims, num_outputs=self.num_intersections) if head is None else head
+        self.module_dict["head"] = OwnershipHead(dim=dim, input_dims=input_dims, num_outputs=self.num_intersections, include_boardmask=include_boardmask) if head is None else head
+        self.include_boardmask = include_boardmask
 
     #parameters = pax.parameters_method("head", "backbone")
 
@@ -218,7 +220,8 @@ class TransferResnet(pax.Module):
         if not batched:
             board_mask = board_mask[None]
         x = jnp.concatenate((x, mask), axis=-1)
-        x = jnp.concatenate((x, board_mask), axis=-1)
+        if self.include_boardmask:
+            x = jnp.concatenate((x, board_mask), axis=-1)
         return self.module_dict["head"](x, batched=batched)
 
     #def train(self: T) -> T:
