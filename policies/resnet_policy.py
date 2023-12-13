@@ -224,7 +224,40 @@ class TransferResnet(pax.Module):
             x = jnp.concatenate((x, board_mask), axis=-1)
         return self.module_dict["head"](x, batched=batched)
 
-    #def train(self: T) -> T:
-    #    self.apply(lambda mod: mod.replace(_training=True)) #super().train()
-    #    self.backbone = self.backbone.eval() #self.head.apply(lambda mod: mod.replace(_training=True))
-    #    return self
+
+class BareHead(pax.Module):
+    # backbone: ResnetPolicyValueNet
+    # head: OwnershipHead
+
+    def __init__(self, head: OwnershipHead = None, input_dims=(19, 19), include_boardmask=False):
+        super().__init__()
+        # input_dims = backbone.input_dims
+        if len(input_dims) == 3:
+            input_dims = input_dims[:-1]
+            self.has_channel_dim = True
+        else:
+            self.has_channel_dim = False
+        self.module_dict = {}
+        dim = 9
+        self.num_intersections = input_dims[0] * input_dims[1]
+        self.module_dict["head"] = OwnershipHead(dim=dim, input_dims=input_dims, num_outputs=self.num_intersections, include_boardmask=include_boardmask) if head is None else head
+        self.include_boardmask = include_boardmask
+
+    #parameters = pax.parameters_method("head", "backbone")
+
+    def __call__(self, input: List[chex.Array], batched: bool = False):
+        x, mask, board_mask = input
+        x = x.astype(jnp.float32)
+        mask = mask.astype(jnp.float32)
+        board_mask = board_mask.astype(jnp.float32)
+        mask = mask[..., None]
+        if not batched:
+            mask = mask[None]
+        board_mask = board_mask[..., None]
+        if not batched:
+            board_mask = board_mask[None]
+        x = jnp.concatenate((x, mask), axis=-1)
+        if self.include_boardmask:
+            x = jnp.concatenate((x, board_mask), axis=-1)
+        return self.module_dict["head"](x, batched=batched)
+

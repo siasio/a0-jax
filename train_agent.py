@@ -30,7 +30,7 @@ from games.env import Enviroment
 from play import PlayResults, agent_vs_agent_multiple_games
 from tree_search import improve_policy_with_mcts, recurrent_fn
 from utils import batched_policy, env_step, import_class, replicate, reset_env, stack_last_state
-from policies.resnet_policy import TransferResnet, ResnetPolicyValueNet128
+from policies.resnet_policy import TransferResnet, ResnetPolicyValueNet128, BareHead
 from local_pos_masks import AnalyzedPosition
 from typing import Tuple
 import datetime
@@ -390,7 +390,7 @@ def train(
         num_iterations: int = 361,
         learning_rate: float = 1e-2,  # Originally 0.01,
         ckpt_filename: str = "go_agent_9x9_128_sym.ckpt",
-        trained_ckpt_filename: str = "trained_2023-12-frozen.ckpt",
+        trained_ckpt_filename: str = "trained_2023-12-barehead.ckpt",
         root_dir: str = ".",
         random_seed: int = 42,
         weight_decay: float = 1e-4,
@@ -429,7 +429,8 @@ def train(
     def lr_backbone_schedule(step):
         return step > backbone_lr_steps
 
-    transfer_model = TransferResnet(agent, include_boardmask=not use_only_19x19)
+    # transfer_model = TransferResnet(agent, include_boardmask=not use_only_19x19)
+    transfer_model = BareHead(include_boardmask=not use_only_19x19)
 
     optim = opax.chain(
         opax.add_decayed_weights(weight_decay),
