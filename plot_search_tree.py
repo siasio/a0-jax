@@ -19,7 +19,7 @@ import pickle
 
 import jax
 import jax.numpy as jnp
-import pygraphviz
+# import pygraphviz
 from fire import Fire
 
 from tree_search import improve_policy_with_mcts, recurrent_fn
