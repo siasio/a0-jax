@@ -114,10 +114,10 @@ def collect_ownership_data(log_path, use_only_19x19=True):
                 gtp_games = f.read().splitlines()
                 for gtp_game in gtp_games:
                     a0pos = get_position(json.loads(gtp_game))
-                    if use_only_19x19 and (a0pos.size_x != 19 or a0pos.size_y != 19):
-                        continue
                     if a0pos is None:
                         print(f'Bad log found in {file}: {gtp_game}')
+                        continue
+                    if use_only_19x19 and (a0pos.size_x != 19 or a0pos.size_y != 19):
                         continue
                     move_num = a0pos.move_num
                     try:
@@ -141,7 +141,7 @@ def collect_ownership_data(log_path, use_only_19x19=True):
                                                            has_next_move=jnp.array(has_next_move),
                                                            next_move_color=jnp.array(color),
                                                            next_move_coords=jnp.array(coords),
-                                                           color_to_move=jnp.array(-a0pos.last_color),
+                                                           color_to_move=jnp.array(a0pos.color_to_play),  # -a0pos.last_color),
                                                            # move=jnp.array(move),
                                                            mask=jnp.array(mask),
                                                            board_mask=jnp.array(a0pos.board_mask),
@@ -269,8 +269,8 @@ def train_ownership_step(net, optim, data: TrainingOwnershipDatapoint):
 @partial(jax.pmap, axis_name="i")
 def test_ownership(net, data: TrainingOwnershipDatapoint):
     """Evaluation on test set."""
-    (top_1_acc, mse_loss), _ = jax.value_and_grad(calculate_metrics, has_aux=True)(net, data)
-    return top_1_acc, mse_loss
+    (top_1_acc, (top_2_acc, mse_loss)), _ = jax.value_and_grad(calculate_metrics, has_aux=True)(net, data)
+    return top_1_acc, top_2_acc, mse_loss
 
 
 def calculate_metrics(net, data: TrainingOwnershipDatapoint):
@@ -278,11 +278,12 @@ def calculate_metrics(net, data: TrainingOwnershipDatapoint):
 
     action_logits = flatten_preds(action_logits)
     top_1_acc = (action_logits.argmax(axis=1) == data.move.argmax(axis=1)).mean()
+    top_2_acc = (jnp.argsort(action_logits, axis=1)[:, -2:] == data.move.argmax(axis=1)[..., None]).any(axis=1).mean()
     flattened_ownership_mask = data.mask.reshape(data.mask.shape[0], -1)
     flattened_ownership_map = ownership_map.reshape(ownership_map.shape[0], -1)
     mse_loss = optax.l2_loss(flattened_ownership_map * flattened_ownership_mask,
                              data.value.reshape(data.value.shape[0], -1) * flattened_ownership_mask)
-    return top_1_acc, mse_loss
+    return top_1_acc, (top_2_acc, mse_loss)
 
 
 def multi_transform(schedule_fn: Callable[[jnp.ndarray], jnp.ndarray]):
@@ -326,7 +327,8 @@ def save_model(trained_ckpt_path, model, iteration):
 def test_model(test_data, batch_size, model, optim, value_loss, policy_loss, _stack_and_reshape, devices):
     transfer_model = model.eval()
     transfer_model, optim = jax.device_put_replicated((transfer_model, optim), devices)
-    accs = []
+    accs1 = []
+    accs2 = []
     mses = []
     ids = range(0, len(test_data) - batch_size, batch_size)
     with click.progressbar(ids, label="  test model   ") as progressbar:
@@ -335,11 +337,13 @@ def test_model(test_data, batch_size, model, optim, value_loss, policy_loss, _st
             # I needed to move axis
             batch = [construct_training_datapoint(d) for d in batch]
             batch = jax.tree_util.tree_map(_stack_and_reshape, *batch)
-            top_1_acc, mse = test_ownership(transfer_model, batch)
-            accs.append(top_1_acc)
+            top_1_acc, top_2_acc, mse = test_ownership(transfer_model, batch)
+            accs1.append(top_1_acc)
+            accs2.append(top_2_acc)
             mses.append(mse)
 
-    top_1_acc = np.mean(accs)
+    top_1_acc = np.mean(accs1)
+    top_2_acc = np.mean(accs2)
     mse = np.mean(mses)
 
     if value_loss is not None or policy_loss is not None:
@@ -350,6 +354,7 @@ def test_model(test_data, batch_size, model, optim, value_loss, policy_loss, _st
     backbone_multiplier = optim[2].backbone_multiplier[0]
     print(text_to_print +
           f"  test top 1 acc {top_1_acc:.3f}"
+          f"  test top 2 acc {top_2_acc:.3f}"
           f"  test ownership MSE {mse:.4f}"
           f"  learning rate {lr:.1e}"
           f"  backbone multiplier {backbone_multiplier:.1f}"
@@ -390,12 +395,12 @@ def train(
         num_iterations: int = 361,
         learning_rate: float = 1e-2,  # Originally 0.01,
         ckpt_filename: str = "go_agent_9x9_128_sym.ckpt",
-        trained_ckpt_filename: str = "trained_2023-12-barehead.ckpt",
+        trained_ckpt_filename: str = "trained_2023-12-prevmoves-unfrozen3.ckpt",
         root_dir: str = ".",
         random_seed: int = 42,
         weight_decay: float = 1e-4,
         lr_decay_steps: int = 10_000,  # My full epoch is likely shorter than 100_000 steps
-        backbone_lr_steps: int = 150_000,  # was 25_000 in August
+        backbone_lr_steps: int = 15_000,  # was 25_000 in August
         use_only_19x19: bool = True,
 ):
     if root_dir == ".":
@@ -429,8 +434,8 @@ def train(
     def lr_backbone_schedule(step):
         return step > backbone_lr_steps
 
-    # transfer_model = TransferResnet(agent, include_boardmask=not use_only_19x19)
-    transfer_model = BareHead(include_boardmask=not use_only_19x19)
+    transfer_model = TransferResnet(agent, include_boardmask=not use_only_19x19)
+    # transfer_model = BareHead(include_boardmask=not use_only_19x19)
 
     optim = opax.chain(
         opax.add_decayed_weights(weight_decay),
