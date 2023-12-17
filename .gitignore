@@ -129,5 +129,5 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-torczyk.pt
-go_agent_9x9_128_sym.ckpt
+*.pt
+*.ckpt
