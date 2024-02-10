@@ -36,7 +36,7 @@ from typing import Tuple
 import datetime
 
 EPSILON = 1e-9  # a very small positive value
-TRAIN_DIR = "zip_logs"
+TRAIN_DIR = "zip_logs_new"
 TEST_DIR = "test_dir"
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = '.79'
 
@@ -102,7 +102,7 @@ def collect_ownership_data(log_path, use_only_19x19=True):
         except:
             return None
         return a0position
-
+    exception_counter = 0
     data = []
     for tupla in os.walk(log_path):
         dir, inside_dirs, files = tupla
@@ -115,15 +115,17 @@ def collect_ownership_data(log_path, use_only_19x19=True):
                 for gtp_game in gtp_games:
                     a0pos = get_position(json.loads(gtp_game))
                     if a0pos is None:
-                        print(f'Bad log found in {file}: {gtp_game}')
+                        # print(f'Bad log found in {file}: {gtp_game}')
+                        exception_counter += 1
                         continue
                     if use_only_19x19 and (a0pos.size_x != 19 or a0pos.size_y != 19):
                         continue
                     move_num = a0pos.move_num
                     try:
                         data_list = a0pos.get_single_local_pos(move_num=move_num)
-                    except AssertionError as e:
-                        print(e)
+                    except Exception as e:
+                        # print(e)
+                        exception_counter += 1
                         continue
                     for datapoint in data_list:
                         mask, position_list, coords, color, value = datapoint
@@ -147,6 +149,7 @@ def collect_ownership_data(log_path, use_only_19x19=True):
                                                            board_mask=jnp.array(a0pos.board_mask),
                                                            value=jnp.array(value))
                         data.append(example)
+    print(f'{log_path} Exception counter: {exception_counter}')
     return data
 
 
@@ -363,39 +366,39 @@ def test_model(test_data, batch_size, model, optim, value_loss, policy_loss, _st
     return value_loss, policy_loss, top_1_acc, mse, lr, backbone_multiplier
 
 
-def check_backbone(ckpt_path, trained_ckpt_path, agent):
-    """
-    Simple utility to check if the backbone weights were indeed frozen
-    """
-    print("Loading weights at", ckpt_path)
-    with open(ckpt_path, "rb") as f:
-        dic = pickle.load(f)
-        if "agent" in dic:
-            dic = dic["agent"]
-        agent = agent.load_state_dict(dic)
-    jax.tree_util.tree_map(lambda p: print(np.sum(p)), agent)
-    transfer_model = TransferResnet(agent)
-
-    if os.path.isfile(trained_ckpt_path):
-        print('Loading trained weights at', trained_ckpt_path)
-        with open(trained_ckpt_path, "rb") as f:
-            loaded_agent = pickle.load(f)
-            if "agent" in loaded_agent:
-                loaded_agent = loaded_agent["agent"]
-            transfer_model = transfer_model.load_state_dict(loaded_agent)
-
-    jax.tree_util.tree_map(lambda p: print(np.sum(p)), transfer_model.module_dict["backbone"])
+def plot_stats(filename, root_dir):
+    with open(filename, "rb") as f:
+        v_losses, p_losses, t1_accs, mses, lrs, bms, indices = pickle.load(f)
+    os.makedirs(os.path.dirname(root_dir), exist_ok=True)
+    run_name = os.path.basename(filename).rsplit('.', 1)[0]
+    import matplotlib.pyplot as plt
+    plt.plot(v_losses)
+    plt.plot(p_losses)
+    plt.plot(t1_accs)
+    plt.plot([None] + [mse * 1000 for mse in mses])
+    plt.plot([lr * 100 for lr in lrs])
+    plt.plot(bms)
+    plt.xticks(indices)
+    plt.legend(['Value loss', 'Policy loss', 'Top 1 accuracy', 'MSE * 1000', 'Learning rate * 100', 'Backbone multiplier'])
+    plt.savefig(os.path.join(root_dir, f'metrics-{run_name}.png'))
+    # print the list of floats with only 3 decimals
+    print("Value losses:", ", ".join([f"{v_loss:.3f}" for v_loss in v_losses if v_loss is not None]))
+    print("Policy losses:", ", ".join([f"{p_loss:.3f}" for p_loss in p_losses if p_loss is not None]))
+    print("Top 1 accuracies:", ", ".join([f"{t1_acc:.3f}" for t1_acc in t1_accs if t1_acc is not None]))
+    print("MSEs:", ", ".join([f"{mse:.3f}" for mse in mses if mse is not None]))
+    print("Learning rates:", ", ".join([f"{lr:.3f}" for lr in lrs if lr is not None]))
+    print("Backbone multipliers:", ", ".join([f"{bm:.3f}" for bm in bms if bm is not None]))
 
 
 @pax.pure
 def train(
+        trained_ckpt_filename: str,
         game_class="games.go_game.GoBoard9x9",
         agent_class="policies.resnet_policy.ResnetPolicyValueNet128",
         training_batch_size: int = 128,  # Originally 128 but maybe I'm getting OOM
         num_iterations: int = 361,
         learning_rate: float = 1e-2,  # Originally 0.01,
         ckpt_filename: str = "go_agent_9x9_128_sym.ckpt",
-        trained_ckpt_filename: str = "trained_2023-12-prevmoves-unfrozen3.ckpt",
         root_dir: str = ".",
         random_seed: int = 42,
         weight_decay: float = 1e-4,
@@ -415,7 +418,8 @@ def train(
 
     # STAS-08: moved the following lines loading weights before transfer_model definition
     ckpt_path = os.path.join(root_dir, ckpt_filename)
-    trained_ckpt_path = os.path.join(root_dir, trained_ckpt_filename)
+    trained_ckpt_path = os.path.join(root_dir, 'models', trained_ckpt_filename)
+    os.makedirs(os.path.dirname(trained_ckpt_path), exist_ok=True)
     # check_backbone(ckpt_path, trained_ckpt_path, agent)
     # return
     start_iter = 1
@@ -490,11 +494,12 @@ def train(
     value_loss, policy_loss = None, None
 
     v_losses, p_losses, t1_accs, mses, lrs, bms, indices = [], [], [], [], [], [], []
+    stats_pickle_name = trained_ckpt_path.rsplit('.', 1)[0] + '_stats.pkl'
 
     for iteration in range(start_iter, num_iterations):
         print(f"Iteration {iteration}")
 
-        if iteration % 20 == 1 or iteration in (6, 11, 16, 360):
+        if iteration % 20 == 1 or iteration in (6, 11, 16):
             value_loss, policy_loss, top_1_acc, mse, lr, backbone_multiplier = test_model(test_data, training_batch_size, transfer_model, optim, value_loss, policy_loss, _stack_and_reshape, devices)
             v_losses.append(value_loss)
             p_losses.append(policy_loss)
@@ -512,6 +517,20 @@ def train(
                     with zipfile.ZipFile(zip_path, "r") as zip_ref:
                         zip_ref.extractall(path=zip_path[:-4])
                 except:
+                    value_loss, policy_loss, top_1_acc, mse, lr, backbone_multiplier = test_model(test_data,
+                                                                                                  training_batch_size,
+                                                                                                  transfer_model, optim,
+                                                                                                  value_loss,
+                                                                                                  policy_loss,
+                                                                                                  _stack_and_reshape,
+                                                                                                  devices)
+                    v_losses.append(value_loss)
+                    p_losses.append(policy_loss)
+                    t1_accs.append(top_1_acc)
+                    mses.append(mse)
+                    lrs.append(lr)
+                    bms.append(backbone_multiplier)
+                    indices.append(iteration)
                     break
             unzipped = zip_path[:-4]
             for folder in os.listdir(unzipped):
@@ -547,27 +566,37 @@ def train(
         if iteration % 20 == 1:
             # save agent's weights to disk
             save_model(trained_ckpt_path, transfer_model, iteration)
+        with open(stats_pickle_name, "wb") as f:
+            pickle.dump((v_losses, p_losses, t1_accs, mses, lrs, bms, indices), f)
     save_model(trained_ckpt_path, transfer_model, num_iterations - 1)
     # Plot metrics
-    import matplotlib.pyplot as plt
-    plt.plot(v_losses)
-    plt.plot(p_losses)
-    plt.plot(t1_accs)
-    plt.plot([None] + [mse * 1000 for mse in mses])
-    plt.plot([lr * 100 for lr in lrs])
-    plt.plot(bms)
-    plt.xticks(indices)
-    plt.legend(['Value loss', 'Policy loss', 'Top 1 accuracy', 'MSE * 1000', 'Learning rate * 100', 'Backbone multiplier'])
-    plt.savefig(os.path.join(root_dir, 'metrics-frozen.png'))
-    # print the list of floats with only 3 decimals
-    print("Value losses:", ", ".join([f"{v_loss:.3f}" for v_loss in v_losses if v_loss is not None]))
-    print("Policy losses:", ", ".join([f"{p_loss:.3f}" for p_loss in p_losses if p_loss is not None]))
-    print("Top 1 accuracies:", ", ".join([f"{t1_acc:.3f}" for t1_acc in t1_accs if t1_acc is not None]))
-    print("MSEs:", ", ".join([f"{mse:.3f}" for mse in mses if mse is not None]))
-    print("Learning rates:", ", ".join([f"{lr:.3f}" for lr in lrs if lr is not None]))
-    print("Backbone multipliers:", ", ".join([f"{bm:.3f}" for bm in bms if bm is not None]))
+    plot_stats(stats_pickle_name, os.path.join(root_dir, 'stats'))
 
     print("Done!")
+
+
+def check_backbone(ckpt_path, trained_ckpt_path, agent):
+    """
+    Simple utility to check if the backbone weights were indeed frozen
+    """
+    print("Loading weights at", ckpt_path)
+    with open(ckpt_path, "rb") as f:
+        dic = pickle.load(f)
+        if "agent" in dic:
+            dic = dic["agent"]
+        agent = agent.load_state_dict(dic)
+    jax.tree_util.tree_map(lambda p: print(np.sum(p)), agent)
+    transfer_model = TransferResnet(agent)
+
+    if os.path.isfile(trained_ckpt_path):
+        print('Loading trained weights at', trained_ckpt_path)
+        with open(trained_ckpt_path, "rb") as f:
+            loaded_agent = pickle.load(f)
+            if "agent" in loaded_agent:
+                loaded_agent = loaded_agent["agent"]
+            transfer_model = transfer_model.load_state_dict(loaded_agent)
+
+    jax.tree_util.tree_map(lambda p: print(np.sum(p)), transfer_model.module_dict["backbone"])
 
 
 """
