@@ -215,11 +215,10 @@ def flatten_preds(preds_361):
 
 
 def construct_flat_mask(data: TrainingOwnershipDatapoint):
-    if data.move[-1] == 1:
-        return flatten_mask(jnp.zeros_like(data.mask), allow_last=True)
-    else:
-        allowed_moves_mask = (data.mask == 1) & (data.state[..., 7] == 0)
-        return flatten_mask(allowed_moves_mask, allow_last=False)
+    allowed_moves_mask = (data.mask == 1) & (data.state[..., 7] == 0)
+    mask_for_non_terminal = flatten_mask(allowed_moves_mask, allow_last=False)
+    mask_for_terminal = flatten_mask(jnp.zeros_like(data.mask), allow_last=True)
+    return jnp.where(data.move[-1] == 0, mask_for_non_terminal, mask_for_terminal)
 
 
 def construct_training_datapoint(d: TrainingOwnershipExample):
