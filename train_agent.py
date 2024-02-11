@@ -238,6 +238,8 @@ def ownership_loss_fn(net, data: TrainingOwnershipDatapoint):
     mse_loss = optax.l2_loss(flattened_ownership_map * flattened_ownership_mask,
                              data.value.reshape(data.value.shape[0], -1) * flattened_ownership_mask)
     mse_loss = jnp.mean(mse_loss)
+    mse_weight = 500.
+    mse_loss = mse_loss * mse_weight
 
     # policy loss (KL(target_policy', agent_policy))
     action_logits = flatten_preds(action_logits)
@@ -246,7 +248,7 @@ def ownership_loss_fn(net, data: TrainingOwnershipDatapoint):
     soft_action_logits = jax.nn.softmax(action_logits, axis=-1)
 
     flat_mask = construct_flat_mask(data)
-    penalty_weight = 2.
+    penalty_weight = 4.
 
     cross_entropy_loss = - jnp.sum(target_pr * log_action_logits, axis=-1)
     cross_entropy_loss = jnp.mean(cross_entropy_loss)
@@ -259,7 +261,7 @@ def ownership_loss_fn(net, data: TrainingOwnershipDatapoint):
     total_loss = cross_entropy_loss + invalid_moves_penalty
 
     # return the total loss
-    return mse_loss + total_loss, (net, (mse_loss, total_loss))
+    return mse_loss + total_loss, (net, (mse_loss, cross_entropy_loss, invalid_moves_penalty))
 
 
 @partial(jax.pmap, axis_name="i")
@@ -329,7 +331,7 @@ def save_model(trained_ckpt_path, model, iteration):
         pickle.dump(dic, writer)
 
 
-def test_model(test_data, batch_size, model, optim, value_loss, policy_loss, _stack_and_reshape, devices):
+def test_model(test_data, batch_size, model, optim, ownership_loss, policy_loss, invalid_moves_penalty, _stack_and_reshape, devices):
     transfer_model = model.eval()
     transfer_model, optim = jax.device_put_replicated((transfer_model, optim), devices)
     accs1 = []
@@ -351,8 +353,8 @@ def test_model(test_data, batch_size, model, optim, value_loss, policy_loss, _st
     top_2_acc = np.mean(accs2)
     mse = np.mean(mses)
 
-    if value_loss is not None or policy_loss is not None:
-        text_to_print = f"  ownership loss {value_loss:.3f}  policy loss {policy_loss:.3f}"
+    if ownership_loss is not None or policy_loss is not None:
+        text_to_print = f"  ownership loss {ownership_loss:.3f}  policy loss {policy_loss:.3f} invalid moves penalty {invalid_moves_penalty:.3f}"
     else:
         text_to_print = ""
     lr = optim[1][-1].learning_rate[0]
@@ -365,28 +367,30 @@ def test_model(test_data, batch_size, model, optim, value_loss, policy_loss, _st
           f"  backbone multiplier {backbone_multiplier:.1f}"
           f"  time {datetime.datetime.now().strftime('%H:%M:%S')}"
           )
-    return value_loss, policy_loss, top_1_acc, mse, lr, backbone_multiplier
+    return top_1_acc, mse, lr, backbone_multiplier
 
 
 def plot_stats(filename, root_dir):
     with open(filename, "rb") as f:
-        v_losses, p_losses, t1_accs, mses, lrs, bms, indices = pickle.load(f)
+        o_losses, p_losses, i_losses, t1_accs, mses, lrs, bms, indices, loss_indices = pickle.load(f)
     os.makedirs(os.path.dirname(root_dir), exist_ok=True)
     run_name = os.path.basename(filename).rsplit('.', 1)[0]
     import matplotlib.pyplot as plt
     plt.xticks(indices)
-    plt.plot(indices, v_losses)
-    plt.plot(indices, p_losses)
+    plt.plot(loss_indices, o_losses)
+    plt.plot(loss_indices, p_losses)
+    plt.plot(loss_indices, i_losses)
     plt.plot(indices, t1_accs)
     plt.plot(indices, [mse * 500 for mse in mses])
     plt.plot(indices, [lr * 100 for lr in lrs])
     plt.plot(indices, bms)
     plt.ylim(0, 3)
-    plt.legend(['Value loss', 'Policy loss', 'Top 1 accuracy', 'MSE * 500', 'Learning rate * 100', 'Backbone multiplier'])
+    plt.legend(['Ownership loss', 'Policy loss', 'Invalid loss', 'Top 1 accuracy', 'MSE * 500', 'Learning rate * 100', 'Backbone multiplier'])
     plt.savefig(os.path.join(root_dir, f'metrics-{run_name}.png'))
     # print the list of floats with only 3 decimals
-    print("Value losses:", ", ".join([f"{v_loss:.3f}" for v_loss in v_losses if v_loss is not None]))
+    print("Ownership losses:", ", ".join([f"{v_loss:.3f}" for v_loss in o_losses if v_loss is not None]))
     print("Policy losses:", ", ".join([f"{p_loss:.3f}" for p_loss in p_losses if p_loss is not None]))
+    print("Invalid moves penalties:", ", ".join([f"{i_loss:.3f}" for i_loss in i_losses if i_loss is not None]))
     print("Top 1 accuracies:", ", ".join([f"{t1_acc:.3f}" for t1_acc in t1_accs if t1_acc is not None]))
     print("MSEs:", ", ".join([f"{mse:.3f}" for mse in mses if mse is not None]))
     print("Learning rates:", ", ".join([f"{lr:.3f}" for lr in lrs if lr is not None]))
@@ -494,23 +498,21 @@ def train(
         last_unpacked = 0
     print(f"Unpacked: {unpacked}")
 
-    value_loss, policy_loss = None, None
+    ownership_loss, policy_loss, invalid_moves_penalty = None, None, None
 
-    v_losses, p_losses, t1_accs, mses, lrs, bms, indices = [], [], [], [], [], [], []
+    o_losses, p_losses, i_losses, t1_accs, mses, lrs, bms, indices, loss_indices = [], [], [], [], [], [], [], [], []
     stats_pickle_name = trained_ckpt_path.rsplit('.', 1)[0] + '_stats.pkl'
 
     for iteration in range(start_iter, num_iterations):
         print(f"Iteration {iteration}")
 
         if iteration % 20 == 1 or iteration in (6, 11, 16):
-            value_loss, policy_loss, top_1_acc, mse, lr, backbone_multiplier = test_model(test_data, training_batch_size, transfer_model, optim, value_loss, policy_loss, _stack_and_reshape, devices)
-            v_losses.append(value_loss)
-            p_losses.append(policy_loss)
-            t1_accs.append(top_1_acc)
-            mses.append(mse)
-            lrs.append(lr)
-            bms.append(backbone_multiplier)
-            indices.append(iteration)
+            top_1_acc, mse, lr, backbone_multiplier = test_model(test_data, training_batch_size, transfer_model, optim, ownership_loss, policy_loss, invalid_moves_penalty, _stack_and_reshape, devices)
+            t1_accs.append(float(top_1_acc))
+            mses.append(float(mse))
+            lrs.append(float(lr))
+            bms.append(float(backbone_multiplier))
+            indices.append(float(iteration-1))
         pickle_path = os.path.join(root_dir, TRAIN_DIR, f'datasmall{iteration:04}.pkl')
         if not os.path.isfile(pickle_path):
             last_unpacked += 1
@@ -520,20 +522,19 @@ def train(
                     with zipfile.ZipFile(zip_path, "r") as zip_ref:
                         zip_ref.extractall(path=zip_path[:-4])
                 except:
-                    value_loss, policy_loss, top_1_acc, mse, lr, backbone_multiplier = test_model(test_data,
-                                                                                                  training_batch_size,
-                                                                                                  transfer_model, optim,
-                                                                                                  value_loss,
-                                                                                                  policy_loss,
-                                                                                                  _stack_and_reshape,
-                                                                                                  devices)
-                    v_losses.append(value_loss)
-                    p_losses.append(policy_loss)
-                    t1_accs.append(top_1_acc)
-                    mses.append(mse)
-                    lrs.append(lr)
-                    bms.append(backbone_multiplier)
-                    indices.append(iteration)
+                    top_1_acc, mse, lr, backbone_multiplier = test_model(test_data,
+                                                                         training_batch_size,
+                                                                         transfer_model, optim,
+                                                                         ownership_loss,
+                                                                         policy_loss,
+                                                                         invalid_moves_penalty,
+                                                                         _stack_and_reshape,
+                                                                         devices)
+                    t1_accs.append(float(top_1_acc))
+                    mses.append(float(mse))
+                    lrs.append(float(lr))
+                    bms.append(float(backbone_multiplier))
+                    indices.append(float(iteration-1))
                     break
             unzipped = zip_path[:-4]
             for folder in os.listdir(unzipped):
@@ -561,16 +562,24 @@ def train(
                 transfer_model, optim, loss = train_ownership_step(transfer_model, optim, batch)
                 losses.append(loss)
 
-        value_loss, policy_loss = zip(*losses)
-        value_loss = np.mean(sum(jax.device_get(loss))) / len(loss)
+        ownership_loss, policy_loss, invalid_moves_penalty = zip(*losses)
+        ownership_loss = np.mean(sum(jax.device_get(ownership_loss))) / len(ownership_loss)
         policy_loss = np.mean(sum(jax.device_get(policy_loss))) / len(policy_loss)
+        invalid_moves_penalty = np.mean(sum(jax.device_get(invalid_moves_penalty))) / len(invalid_moves_penalty)
+        o_losses.append(float(ownership_loss))
+        p_losses.append(float(policy_loss))
+        i_losses.append(float(invalid_moves_penalty))
+        loss_indices.append(int(iteration))
+
         transfer_model, optim = jax.tree_util.tree_map(lambda x: x[0], (transfer_model, optim))
 
         if iteration % 20 == 1:
             # save agent's weights to disk
             save_model(trained_ckpt_path, transfer_model, iteration)
         with open(stats_pickle_name, "wb") as f:
-            pickle.dump((v_losses, p_losses, t1_accs, mses, lrs, bms, indices), f)
+            pickle.dump((o_losses, p_losses, i_losses, t1_accs, mses, lrs, bms, indices, loss_indices), f)
+    with open(stats_pickle_name, "wb") as f:
+        pickle.dump((o_losses, p_losses, i_losses, t1_accs, mses, lrs, bms, indices, loss_indices), f)
     save_model(trained_ckpt_path, transfer_model, num_iterations - 1)
     # Plot metrics
     plot_stats(stats_pickle_name, os.path.join(root_dir, 'stats'))
