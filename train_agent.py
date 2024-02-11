@@ -378,10 +378,11 @@ def plot_stats(filename, root_dir):
     plt.plot(indices, v_losses)
     plt.plot(indices, p_losses)
     plt.plot(indices, t1_accs)
-    plt.plot(indices, [None] + [mse * 1000 for mse in mses])
+    plt.plot(indices, [mse * 500 for mse in mses])
     plt.plot(indices, [lr * 100 for lr in lrs])
     plt.plot(indices, bms)
-    plt.legend(['Value loss', 'Policy loss', 'Top 1 accuracy', 'MSE * 1000', 'Learning rate * 100', 'Backbone multiplier'])
+    plt.ylim(0, 3)
+    plt.legend(['Value loss', 'Policy loss', 'Top 1 accuracy', 'MSE * 500', 'Learning rate * 100', 'Backbone multiplier'])
     plt.savefig(os.path.join(root_dir, f'metrics-{run_name}.png'))
     # print the list of floats with only 3 decimals
     print("Value losses:", ", ".join([f"{v_loss:.3f}" for v_loss in v_losses if v_loss is not None]))
