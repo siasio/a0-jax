@@ -374,13 +374,13 @@ def plot_stats(filename, root_dir):
     os.makedirs(os.path.dirname(root_dir), exist_ok=True)
     run_name = os.path.basename(filename).rsplit('.', 1)[0]
     import matplotlib.pyplot as plt
-    plt.plot(v_losses)
-    plt.plot(p_losses)
-    plt.plot(t1_accs)
-    plt.plot([None] + [mse * 1000 for mse in mses])
-    plt.plot([lr * 100 for lr in lrs])
-    plt.plot(bms)
     plt.xticks(indices)
+    plt.plot(indices, v_losses)
+    plt.plot(indices, p_losses)
+    plt.plot(indices, t1_accs)
+    plt.plot(indices, [None] + [mse * 1000 for mse in mses])
+    plt.plot(indices, [lr * 100 for lr in lrs])
+    plt.plot(indices, bms)
     plt.legend(['Value loss', 'Policy loss', 'Top 1 accuracy', 'MSE * 1000', 'Learning rate * 100', 'Backbone multiplier'])
     plt.savefig(os.path.join(root_dir, f'metrics-{run_name}.png'))
     # print the list of floats with only 3 decimals
