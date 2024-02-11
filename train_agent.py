@@ -195,9 +195,9 @@ def construct_move_target(has_next_move, coords, color):
     return target_pr
 
 
-def flatten_mask(mask_361):
+def flatten_mask(mask_361, allow_last=True):
     single_flat = mask_361.reshape(mask_361.shape[0], -1)
-    full_flat = jnp.ones((single_flat.shape[0], 723))
+    full_flat = jnp.ones((single_flat.shape[0], 723)) if allow_last else jnp.zeros((single_flat.shape[0], 723))
     full_flat = full_flat.at[..., :361].set(single_flat)
     full_flat = full_flat.at[..., 361:722].set(single_flat)
     return full_flat
@@ -215,8 +215,11 @@ def flatten_preds(preds_361):
 
 
 def construct_flat_mask(data: TrainingOwnershipDatapoint):
-    allowed_moves_mask = (data.mask == 1) & (data.state[..., 7] == 0)
-    return flatten_mask(allowed_moves_mask)
+    if data.move[-1] == 1:
+        return flatten_mask(jnp.zeros_like(data.mask), allow_last=True)
+    else:
+        allowed_moves_mask = (data.mask == 1) & (data.state[..., 7] == 0)
+        return flatten_mask(allowed_moves_mask, allow_last=False)
 
 
 def construct_training_datapoint(d: TrainingOwnershipExample):
