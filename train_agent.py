@@ -89,7 +89,12 @@ class TrainingOwnershipDatapoint:
     @classmethod
     def from_obj(cls, obj: 'TrainingOwnershipExample', **kwargs):
         init_fields = [f.name for f in cls.__dataclass_fields__.values() if f.init and f.name != 'move']
+        # state = apply_random_masking(obj.state, obj.mask)
+        # kwargs['state'] = state
         updated_fields = {field: kwargs.get(field, getattr(obj, field)) for field in init_fields}
+        # current_color = obj.color_to_move if obj.color_to_move == -1 else 1
+        # # TODO: Just don't swap the next move color in get_single_local_pos() instead of changing it back here
+        # original_next_move_color = obj.next_move_color * current_color
         move = construct_move_target(obj.has_next_move, obj.next_move_coords, obj.next_move_color)
         updated_fields['move'] = move
         return cls(**updated_fields)  # type : ignore - why does it not work?
@@ -136,7 +141,7 @@ def collect_ownership_data(log_path, use_only_19x19=True):
                             color = 0
                             has_next_move = False
 
-                        state = jnp.moveaxis(jnp.array(position_list), 0, -1)
+                        state = jnp.array(position_list)  # , 0, -1)
 
                         # value = jnp.array(a0pos.continuous_ownership)  # .flatten()
                         example = TrainingOwnershipExample(state=state,
@@ -218,7 +223,8 @@ def construct_flat_mask(data: TrainingOwnershipDatapoint):
     allowed_moves_mask = (data.mask == 1) & (data.state[..., 7] == 0)
     mask_for_non_terminal = flatten_mask(allowed_moves_mask, allow_last=False)
     mask_for_terminal = flatten_mask(jnp.zeros_like(data.mask), allow_last=True)
-    return jnp.where((data.move[..., -1] == 0)[..., None], mask_for_non_terminal, mask_for_terminal)
+    masked_batch = jnp.where((data.move[..., -1] == 0)[..., None], mask_for_non_terminal, mask_for_terminal)
+    return masked_batch
 
 
 def construct_training_datapoint(d: TrainingOwnershipExample):
@@ -237,8 +243,9 @@ def ownership_loss_fn(net, data: TrainingOwnershipDatapoint):
     flattened_ownership_map = ownership_map.reshape(ownership_map.shape[0], -1)
     mse_loss = optax.l2_loss(flattened_ownership_map * flattened_ownership_mask,
                              data.value.reshape(data.value.shape[0], -1) * flattened_ownership_mask)
+    # mse_loss = jnp.sum(mse_loss, axis=-1) / jnp.sum(flattened_ownership_mask, axis=-1)
     mse_loss = jnp.mean(mse_loss)
-    mse_weight = 500.
+    mse_weight = 50.
     mse_loss = mse_loss * mse_weight
 
     # policy loss (KL(target_policy', agent_policy))
@@ -251,6 +258,12 @@ def ownership_loss_fn(net, data: TrainingOwnershipDatapoint):
     penalty_weight = 4.
 
     cross_entropy_loss = - jnp.sum(target_pr * log_action_logits, axis=-1)
+    num_player = jnp.sum(target_pr[..., :361])
+    num_opponent = jnp.sum(target_pr[..., 361:722])
+    num_pass = jnp.sum(target_pr[..., 722])
+    ce_loss_player = jnp.where(num_player > 0, jnp.sum(jnp.where(jnp.sum(target_pr[..., :361], axis=-1) > 0, cross_entropy_loss, 0)) / num_player, 0)
+    ce_loss_opponent = jnp.where(num_opponent > 0, jnp.sum(jnp.where(jnp.sum(target_pr[..., 361:722], axis=-1) > 0, cross_entropy_loss, 0)) / num_opponent, 0)
+    ce_loss_pass = jnp.where(num_pass > 0, jnp.sum(jnp.where(target_pr[..., 723] > 0, cross_entropy_loss, 0)) / num_pass, 0)
     cross_entropy_loss = jnp.mean(cross_entropy_loss)
 
     # Penalty term for moves outside the mask
@@ -259,9 +272,10 @@ def ownership_loss_fn(net, data: TrainingOwnershipDatapoint):
     invalid_moves_penalty = jnp.mean(invalid_moves_penalty)
 
     total_loss = cross_entropy_loss + invalid_moves_penalty
+    # jax.debug.breakpoint()
 
     # return the total loss
-    return mse_loss + total_loss, (net, (mse_loss, cross_entropy_loss, invalid_moves_penalty))
+    return mse_loss + total_loss, (net, (mse_loss, ce_loss_player, ce_loss_opponent, ce_loss_pass, invalid_moves_penalty, num_player, num_opponent, num_pass))
 
 
 @partial(jax.pmap, axis_name="i")
@@ -290,6 +304,9 @@ def calculate_metrics(net, data: TrainingOwnershipDatapoint):
     flattened_ownership_map = ownership_map.reshape(ownership_map.shape[0], -1)
     mse_loss = optax.l2_loss(flattened_ownership_map * flattened_ownership_mask,
                              data.value.reshape(data.value.shape[0], -1) * flattened_ownership_mask)
+    # mse_loss = jnp.sum(mse_loss, axis=-1) / jnp.sum(flattened_ownership_mask, axis=-1)
+    # mse_loss = jnp.mean(mse_loss)
+
     return top_1_acc, (top_2_acc, mse_loss)
 
 
@@ -331,7 +348,7 @@ def save_model(trained_ckpt_path, model, iteration):
         pickle.dump(dic, writer)
 
 
-def test_model(test_data, batch_size, model, optim, ownership_loss, policy_loss, invalid_moves_penalty, _stack_and_reshape, devices):
+def test_model(test_data, batch_size, model, optim, ownership_loss, policy_loss_pl, policy_loss_op, policy_loss_pass, invalid_moves_penalty, _stack_and_reshape, devices):
     transfer_model = model.eval()
     transfer_model, optim = jax.device_put_replicated((transfer_model, optim), devices)
     accs1 = []
@@ -353,8 +370,8 @@ def test_model(test_data, batch_size, model, optim, ownership_loss, policy_loss,
     top_2_acc = np.mean(accs2)
     mse = np.mean(mses)
 
-    if ownership_loss is not None or policy_loss is not None:
-        text_to_print = f"  ownership loss {ownership_loss:.3f}  policy loss {policy_loss:.3f} invalid moves penalty {invalid_moves_penalty:.3f}"
+    if ownership_loss is not None or policy_loss_pl is not None:
+        text_to_print = f"  ownership loss {ownership_loss:.3f}  policy losses: player {policy_loss_pl:.3f}, opponent {policy_loss_op:.3f}, pass {policy_loss_pass:.3f} invalid moves penalty {invalid_moves_penalty:.3f}"
     else:
         text_to_print = ""
     lr = optim[1][-1].learning_rate[0]
@@ -372,24 +389,28 @@ def test_model(test_data, batch_size, model, optim, ownership_loss, policy_loss,
 
 def plot_stats(filename, root_dir):
     with open(filename, "rb") as f:
-        o_losses, p_losses, i_losses, t1_accs, mses, lrs, bms, indices, loss_indices = pickle.load(f)
+        o_losses, p_losses_pl, p_losses_op, p_losses_pass, i_losses, t1_accs, mses, lrs, bms, indices, loss_indices = pickle.load(f)
     os.makedirs(os.path.dirname(root_dir), exist_ok=True)
     run_name = os.path.basename(filename).rsplit('.', 1)[0]
     import matplotlib.pyplot as plt
     plt.xticks(indices)
     plt.plot(loss_indices, o_losses)
-    plt.plot(loss_indices, p_losses)
+    plt.plot(loss_indices, p_losses_pl)
+    plt.plot(loss_indices, p_losses_op)
+    plt.plot(loss_indices, p_losses_pass)
     plt.plot(loss_indices, i_losses)
     plt.plot(indices, t1_accs)
     plt.plot(indices, [mse * 500 for mse in mses])
     plt.plot(indices, [lr * 100 for lr in lrs])
     plt.plot(indices, bms)
     plt.ylim(0, 3)
-    plt.legend(['Ownership loss', 'Policy loss', 'Invalid loss', 'Top 1 accuracy', 'MSE * 500', 'Learning rate * 100', 'Backbone multiplier'])
+    plt.legend(['Ownership loss', 'Player loss', 'Opponent loss', 'Pass loss', 'Invalid loss', 'Top 1 accuracy', 'MSE * 500', 'Learning rate * 100', 'Backbone multiplier'])
     plt.savefig(os.path.join(root_dir, f'metrics-{run_name}.png'))
     # print the list of floats with only 3 decimals
     print("Ownership losses:", ", ".join([f"{v_loss:.3f}" for v_loss in o_losses if v_loss is not None]))
-    print("Policy losses:", ", ".join([f"{p_loss:.3f}" for p_loss in p_losses if p_loss is not None]))
+    print("Player losses:", ", ".join([f"{p_loss:.3f}" for p_loss in p_losses_pl if p_loss is not None]))
+    print("Opponent losses:", ", ".join([f"{p_loss:.3f}" for p_loss in p_losses_op if p_loss is not None]))
+    print("Pass losses:", ", ".join([f"{p_loss:.3f}" for p_loss in p_losses_pass if p_loss is not None]))
     print("Invalid moves penalties:", ", ".join([f"{i_loss:.3f}" for i_loss in i_losses if i_loss is not None]))
     print("Top 1 accuracies:", ", ".join([f"{t1_acc:.3f}" for t1_acc in t1_accs if t1_acc is not None]))
     print("MSEs:", ", ".join([f"{mse:.3f}" for mse in mses if mse is not None]))
@@ -404,13 +425,13 @@ def train(
         agent_class="policies.resnet_policy.ResnetPolicyValueNet128",
         training_batch_size: int = 128,  # Originally 128 but maybe I'm getting OOM
         num_iterations: int = 361,
-        learning_rate: float = 1e-2,  # Originally 0.01,
+        learning_rate: float = 1e-3,  # Originally 0.01,
         ckpt_filename: str = "go_agent_9x9_128_sym.ckpt",
         root_dir: str = ".",
         random_seed: int = 42,
         weight_decay: float = 1e-4,
         lr_decay_steps: int = 10_000,  # My full epoch is likely shorter than 100_000 steps
-        backbone_lr_steps: int = 15_000,  # was 25_000 in August
+        backbone_lr_steps: int = 0, #15_000,  # was 25_000 in August
         use_only_19x19: bool = True,
 ):
     if root_dir == ".":
@@ -436,7 +457,15 @@ def train(
             dic = pickle.load(f)
             if "agent" in dic:
                 dic = dic["agent"]
+            # w_init = jax.nn.initializers.normal(stddev=1.0 / 100.0)
+            # w_rng_key = jax.random.PRNGKey(8)
+            # dic.backbone.modules[0].weight = dic.backbone.modules[0].weight.at[0, 0, -1, :].set(
+            #     w_init(w_rng_key, (128,)))
             agent = agent.load_state_dict(dic)
+    elif os.path.isfile(trained_ckpt_path):
+        print("Will load already pre-finetuned weights at", trained_ckpt_path)
+    else:
+        print("Not loading weight since no file was found at", ckpt_filename)
 
     def lr_schedule(step):
         e = jnp.floor(step * 1.0 / lr_decay_steps)
@@ -458,8 +487,8 @@ def train(
         print('Loading trained weights at', trained_ckpt_filename)
         with open(trained_ckpt_path, "rb") as f:
             loaded_agent = pickle.load(f)
-            start_iter = loaded_agent["iter"] + 1
-            optim = optim.load_state_dict(loaded_agent["optim"])
+            start_iter = 1 #loaded_agent["iter"] + 1
+            # optim = optim.load_state_dict(loaded_agent["optim"])
             transfer_model = transfer_model.load_state_dict(loaded_agent["agent"])
 
 
@@ -498,16 +527,16 @@ def train(
         last_unpacked = 0
     print(f"Unpacked: {unpacked}")
 
-    ownership_loss, policy_loss, invalid_moves_penalty = None, None, None
+    ownership_loss, policy_loss_pl, policy_loss_op, policy_loss_pass, invalid_moves_penalty = None, None, None, None, None
 
-    o_losses, p_losses, i_losses, t1_accs, mses, lrs, bms, indices, loss_indices = [], [], [], [], [], [], [], [], []
+    o_losses, p_losses_pl, p_losses_op, p_losses_pass, i_losses, t1_accs, mses, lrs, bms, indices, loss_indices = [], [], [], [], [], [], [], [], [], [], []
     stats_pickle_name = trained_ckpt_path.rsplit('.', 1)[0] + '_stats.pkl'
 
     for iteration in range(start_iter, num_iterations):
         print(f"Iteration {iteration}")
 
-        if iteration % 20 == 1 or iteration in (6, 11, 16):
-            top_1_acc, mse, lr, backbone_multiplier = test_model(test_data, training_batch_size, transfer_model, optim, ownership_loss, policy_loss, invalid_moves_penalty, _stack_and_reshape, devices)
+        if iteration % 20 == 2 or iteration in (1, 6, 11, 16):
+            top_1_acc, mse, lr, backbone_multiplier = test_model(test_data, training_batch_size, transfer_model, optim, ownership_loss, policy_loss_pl, policy_loss_op, policy_loss_pass, invalid_moves_penalty, _stack_and_reshape, devices)
             t1_accs.append(float(top_1_acc))
             mses.append(float(mse))
             lrs.append(float(lr))
@@ -526,7 +555,9 @@ def train(
                                                                          training_batch_size,
                                                                          transfer_model, optim,
                                                                          ownership_loss,
-                                                                         policy_loss,
+                                                                         policy_loss_pl,
+                                                                         policy_loss_op,
+                                                                         policy_loss_pass,
                                                                          invalid_moves_penalty,
                                                                          _stack_and_reshape,
                                                                          devices)
@@ -562,14 +593,24 @@ def train(
                 transfer_model, optim, loss = train_ownership_step(transfer_model, optim, batch)
                 losses.append(loss)
 
-        ownership_loss, policy_loss, invalid_moves_penalty = zip(*losses)
+        ownership_loss, policy_loss_pl, policy_loss_op, policy_loss_pass, invalid_moves_penalty, num_player, num_opponent, num_pass = zip(*losses)
         ownership_loss = np.mean(sum(jax.device_get(ownership_loss))) / len(ownership_loss)
-        policy_loss = np.mean(sum(jax.device_get(policy_loss))) / len(policy_loss)
+        policy_loss_pl = np.mean(sum(jax.device_get(policy_loss_pl))) / len(policy_loss_pl)
+        policy_loss_op = np.mean(sum(jax.device_get(policy_loss_op))) / len(policy_loss_op)
+        policy_loss_pass = np.mean(sum(jax.device_get(policy_loss_pass))) / len(policy_loss_pass)
         invalid_moves_penalty = np.mean(sum(jax.device_get(invalid_moves_penalty))) / len(invalid_moves_penalty)
+        num_player = np.mean(sum(jax.device_get(num_player))) / len(num_player)
+        num_opponent = np.mean(sum(jax.device_get(num_opponent))) / len(num_opponent)
+        num_pass = np.mean(sum(jax.device_get(num_pass))) / len(num_pass)
         o_losses.append(float(ownership_loss))
-        p_losses.append(float(policy_loss))
+        p_losses_pl.append(float(policy_loss_pl))
+        p_losses_op.append(float(policy_loss_op))
+        p_losses_pass.append(float(policy_loss_pass))
         i_losses.append(float(invalid_moves_penalty))
         loss_indices.append(int(iteration))
+        # print(f"Avg number of examples with move of player on turn: {num_player:.1f} oppponent: {num_opponent:.1f} pass: {num_pass:.1f}")
+        text_to_print = f"ownership loss {ownership_loss:.3f}  policy losses: player {policy_loss_pl:.3f}, opponent {policy_loss_op:.3f}, pass {policy_loss_pass:.3f} invalid moves penalty {invalid_moves_penalty:.3f}"
+        print(text_to_print)
 
         transfer_model, optim = jax.tree_util.tree_map(lambda x: x[0], (transfer_model, optim))
 
@@ -577,9 +618,9 @@ def train(
             # save agent's weights to disk
             save_model(trained_ckpt_path, transfer_model, iteration)
         with open(stats_pickle_name, "wb") as f:
-            pickle.dump((o_losses, p_losses, i_losses, t1_accs, mses, lrs, bms, indices, loss_indices), f)
+            pickle.dump((o_losses, p_losses_pl, p_losses_op, p_losses_pass, i_losses, t1_accs, mses, lrs, bms, indices, loss_indices), f)
     with open(stats_pickle_name, "wb") as f:
-        pickle.dump((o_losses, p_losses, i_losses, t1_accs, mses, lrs, bms, indices, loss_indices), f)
+        pickle.dump((o_losses, p_losses_pl, p_losses_op, p_losses_pass, i_losses, t1_accs, mses, lrs, bms, indices, loss_indices), f)
     save_model(trained_ckpt_path, transfer_model, num_iterations - 1)
     # Plot metrics
     plot_stats(stats_pickle_name, os.path.join(root_dir, 'stats'))

@@ -142,12 +142,14 @@ class OwnershipHeadShared(pax.Module):
 
 
 class OwnershipHead(pax.Module):
-    def __init__(self, dim, input_dims, num_outputs, include_boardmask=False):
+    def __init__(self, dim, input_dims, num_outputs, include_boardmask=False, include_input=False):
         super().__init__()
         # Input is last layer of the ResNet concatenated with a mask
         initial_dim = dim + 2 if include_boardmask else dim + 1
+        if include_input:
+            initial_dim = initial_dim + 9
         self.ownership_head = pax.Sequential(
-            pax.Conv2D(initial_dim, dim, 3),
+            pax.Conv2D(initial_dim, dim, 1),
             pax.BatchNorm2D(dim, True, True),
             jax.nn.relu,
             pax.Conv2D(dim, 1, 1, padding="VALID"),
@@ -166,7 +168,7 @@ class OwnershipHead(pax.Module):
             #pax.Conv2D(dim, dim, kernel_shape=input_dims, padding="VALID"),
             #pax.BatchNorm2D(dim, True, True),
             #jax.nn.relu,
-            pax.Conv2D(initial_dim, dim, 3),
+            pax.Conv2D(initial_dim, dim, 1),
             pax.BatchNorm2D(dim, True, True),
             jax.nn.relu,
             pax.Conv2D(dim, 2 * num_outputs + 1, kernel_shape=input_dims, padding="VALID"),
@@ -208,17 +210,24 @@ class TransferResnet(pax.Module):
     #parameters = pax.parameters_method("head", "backbone")
 
     def __call__(self, input: List[chex.Array], batched: bool = False):
-        x, mask, board_mask = input
-        x = x.astype(jnp.float32)
+        input_x, mask, board_mask = input
+        input_x = input_x.astype(jnp.float32)
+        # assert jnp.sum(input_x[..., -2]) <= jnp.sum(input_x[..., -3]), "Input not in the canonical form!"
+        # if jnp.sum(input_x[..., -2]) > jnp.sum(input_x[..., -3]):
+        #     print("Input not in the canonical form")
+        # else:
+        #     print("Canonical form correct")
         mask = mask.astype(jnp.float32)
         board_mask = board_mask.astype(jnp.float32)
-        x = self.module_dict["backbone"](x, batched=batched)
+        x = self.module_dict["backbone"](input_x, batched=batched)
         mask = mask[..., None]
         if not batched:
             mask = mask[None]
+            input_x = input_x[None]
         board_mask = board_mask[..., None]
         if not batched:
             board_mask = board_mask[None]
+        # x = jnp.concatenate((x, input_x), axis=-1)
         x = jnp.concatenate((x, mask), axis=-1)
         if self.include_boardmask:
             x = jnp.concatenate((x, board_mask), axis=-1)
@@ -261,4 +270,8 @@ class BareHead(pax.Module):
             x = jnp.concatenate((x, board_mask), axis=-1)
         return self.module_dict["head"](x, batched=batched)
 
-# dummy commit
+
+class InputMaskResnet(TransferResnet):
+    def __init__(self, backbone: ResnetPolicyValueNet, head: OwnershipHead = None, input_dims=(19, 19), include_boardmask=False):
+        super().__init__(backbone, head, input_dims, include_boardmask)
+        backbone.backbone

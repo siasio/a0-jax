@@ -66,9 +66,10 @@ def select_tree(pred: jnp.ndarray, a, b):
 num_recent_positions = 8
 
 
-def stack_last_state(state: np.ndarray):
+def stack_last_state(state: np.ndarray, last_zero: bool = False):
     stacked = np.stack([state] * num_recent_positions)
-    stacked = np.concatenate((stacked, np.zeros_like(state)[None]))
+    color_channel = np.ones_like(state) if last_zero else np.zeros_like(state)
+    stacked = np.concatenate((stacked, color_channel[None]))
     return np.moveaxis(stacked, 0, -1)
 
 

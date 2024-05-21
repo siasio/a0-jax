@@ -13,10 +13,10 @@ from fire import Fire
 def main(
         game_class: str = "games.go_game.GoBoard9x9",
         agent_class="policies.resnet_policy.ResnetPolicyValueNet128",
-        root_dir="/home/test/PycharmProjects/a0-jax/",
-        new_ckpt_filename: str = "new_ckpt.ckpt",
-        old_ckpt_filename: str = "go_agent_9x9_128_sym.ckpt",
-        torch_ckpt_filename: str = "torczyk.pt",
+        # root_dir="/home/test/PycharmProjects/a0-jax/",
+        new_ckpt_filename: str = "elf.ckpt", #new_ckpt.ckpt",
+        old_ckpt_filename: str = None, #"go_agent_9x9_128_sym.ckpt",
+        torch_ckpt_filename: str = "pretrained-go-19x19-v2.bin",  # "torczyk.pt",
         to_torch=False,
 ):
     """Load agent's weight from disk and start the game."""
@@ -46,13 +46,17 @@ def main(
         if isinstance(d, dict):
             return dict({key: to_np(d[key], counter + 1) for key in d})
 
+    root_dir = os.getcwd()
     loader = pickle if to_torch else torch
     ckpt_to_convert = old_ckpt_filename if to_torch else torch_ckpt_filename
     with open(os.path.join(root_dir, ckpt_to_convert), "rb") as f:
         sd = torch.load(f)
 
     if not to_torch:
-        sd = sd["agent"]
+        try:
+            sd = sd["agent"]
+        except:
+            sd = sd["state_dict"]
     sd = to_np(sd)
 
     converted_ckpt = torch_ckpt_filename if to_torch else new_ckpt_filename
