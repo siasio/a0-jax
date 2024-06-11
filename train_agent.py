@@ -3,7 +3,6 @@ AlphaZero training script.
 
 Train agent by self-play only.
 """
-import datetime
 import json
 import os
 import pickle
@@ -11,7 +10,7 @@ import random
 import shutil
 import zipfile
 from functools import partial
-from typing import Optional, Callable
+from typing import Callable
 
 import chex
 import click
@@ -26,13 +25,9 @@ import optax
 import pax
 from opax.transform import GradientTransformation
 
-from games.env import Enviroment
-from play import PlayResults, agent_vs_agent_multiple_games
-from tree_search import improve_policy_with_mcts, recurrent_fn
-from utils import batched_policy, env_step, import_class, replicate, reset_env, stack_last_state
-from policies.resnet_policy import TransferResnet, ResnetPolicyValueNet128, BareHead
-from local_pos_masks import AnalyzedPosition
-from typing import Tuple
+from jax_utils import batched_policy, import_class
+from policies.resnet_policy import TransferResnet
+from legacy.local_pos_masks import AnalyzedPosition
 import datetime
 
 EPSILON = 1e-9  # a very small positive value

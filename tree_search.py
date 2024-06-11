@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import mctx
 
 from games.env import Enviroment as E
-from utils import batched_policy, env_step
+from jax_utils import batched_policy, env_step
 
 
 def recurrent_fn(params, rng_key: chex.Array, action: chex.Array, embedding):

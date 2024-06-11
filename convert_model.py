@@ -2,7 +2,7 @@ import os.path
 
 import torch
 import warnings
-from utils import import_class
+from jax_utils import import_class
 #from jaxlib import xla_extension
 #jax.config.update('jax_array', False)
 import jax.numpy as jnp

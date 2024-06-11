@@ -18,7 +18,7 @@ import tree
 from fire import Fire
 from jax.experimental import jax2tf
 
-from utils import import_class
+from jax_utils import import_class
 
 
 def create_variable(path, value):

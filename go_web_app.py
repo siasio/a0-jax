@@ -11,7 +11,7 @@ import jax.numpy as jnp
 from flask import Flask, jsonify, redirect, request, send_file, url_for
 
 from play import play_one_move
-from utils import env_step, import_class, reset_env
+from jax_utils import env_step, import_class, reset_env
 
 parser = ArgumentParser()
 parser.add_argument("--game-class", default="go_game.GoBoard9x9", type=str)

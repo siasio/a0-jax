@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import pax
 
-from utils import select_tree
+from jax_utils import select_tree
 
 
 class DSU(pax.Module):

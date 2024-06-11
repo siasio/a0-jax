@@ -23,7 +23,7 @@ import jax.numpy as jnp
 from fire import Fire
 
 from tree_search import improve_policy_with_mcts, recurrent_fn
-from utils import import_class, replicate
+from jax_utils import import_class, replicate
 
 
 def main(

@@ -183,7 +183,7 @@ class OwnershipHead(pax.Module):
         #else:
         #    return action_logits[0, 0, 0, :], ownership[0, 0, 0, :]
         if batched:
-            return jnp.squeeze(action_logits), jnp.squeeze(ownership)
+            return jnp.squeeze(action_logits, axis=(1, 2)), jnp.squeeze(ownership, axis=3)
         else:
             return jnp.squeeze(action_logits[0, ...]), jnp.squeeze(ownership[0, ...])
 
@@ -218,18 +218,18 @@ class TransferResnet(pax.Module):
         # else:
         #     print("Canonical form correct")
         mask = mask.astype(jnp.float32)
-        board_mask = board_mask.astype(jnp.float32)
         x = self.module_dict["backbone"](input_x, batched=batched)
         mask = mask[..., None]
         if not batched:
             mask = mask[None]
             input_x = input_x[None]
-        board_mask = board_mask[..., None]
-        if not batched:
-            board_mask = board_mask[None]
         # x = jnp.concatenate((x, input_x), axis=-1)
         x = jnp.concatenate((x, mask), axis=-1)
         if self.include_boardmask:
+            board_mask = board_mask.astype(jnp.float32)
+            board_mask = board_mask[..., None]
+            if not batched:
+                board_mask = board_mask[None]
             x = jnp.concatenate((x, board_mask), axis=-1)
         return self.module_dict["head"](x, batched=batched)
 

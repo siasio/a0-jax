@@ -19,7 +19,7 @@ from fire import Fire
 
 from games.env import Enviroment
 from tree_search import improve_policy_with_mcts, recurrent_fn
-from utils import env_step, import_class, replicate, reset_env
+from jax_utils import env_step, import_class, replicate, reset_env
 
 
 class PlayResults(NamedTuple):

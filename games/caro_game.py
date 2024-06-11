@@ -12,7 +12,7 @@ import numpy as np
 import pax
 
 from games.env import Enviroment
-from utils import select_tree
+from jax_utils import select_tree
 
 
 class CaroWinnerChecker(pax.Module):
