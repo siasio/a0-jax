@@ -24,7 +24,9 @@ import opax
 import optax
 import pax
 from opax.transform import GradientTransformation
+from torch.fx.experimental.symbolic_shapes import eval_is_non_overlapping_and_dense
 
+import data_vis
 from jax_utils import batched_policy, import_class
 from policies.resnet_policy import TransferResnet
 from legacy.local_pos_masks import AnalyzedPosition
@@ -33,6 +35,7 @@ import datetime
 EPSILON = 1e-9  # a very small positive value
 TRAIN_DIR = "zip_logs_new"
 TEST_DIR = "test_dir"
+VIS_DIR = "vis_pdf"
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = '.79'
 
 
@@ -95,7 +98,7 @@ class TrainingOwnershipDatapoint:
         return cls(**updated_fields)  # type : ignore - why does it not work?
 
 
-def collect_ownership_data(log_path, use_only_19x19=True):
+def collect_ownership_data(log_path, use_only_19x19=True, log_pdf=True, num_pages_per_log=5, num_sgfs_per_page=15, vis_path=None):
     def get_position(gtp_row) -> AnalyzedPosition:
         try:
             a0position = AnalyzedPosition.from_gtp_log(gtp_data=gtp_row)
@@ -104,6 +107,8 @@ def collect_ownership_data(log_path, use_only_19x19=True):
         return a0position
     exception_counter = 0
     data = []
+    num_sgfs_to_log = num_pages_per_log * num_sgfs_per_page
+    sgfs_to_log = []
     for tupla in os.walk(log_path):
         dir, inside_dirs, files = tupla
         for file in files:
@@ -127,8 +132,15 @@ def collect_ownership_data(log_path, use_only_19x19=True):
                         # print(e)
                         exception_counter += 1
                         continue
+
+                    if log_pdf and len(sgfs_to_log) < num_sgfs_to_log:
+                        datapoint = random.choice(data_list)
+                        sgf_for_vis = datapoint[-1]
+                        sgfs_to_log.append(sgf_for_vis)
+                    elif len(sgfs_to_log) == num_sgfs_to_log:
+                        data_vis.visualize(sgfs_to_log, log_path)
                     for datapoint in data_list:
-                        mask, position_list, coords, color, value = datapoint
+                        mask, position_list, coords, color, value, sente, _ = datapoint
                         has_next_move = True
                         if coords is None or color is None:
                             assert coords is None and color is None
@@ -504,7 +516,7 @@ def train(
         with open(pickle_test_path, "rb") as f:
             test_data = cloudpickle.load(f)
     else:
-        test_data = collect_ownership_data(os.path.join(root_dir, TEST_DIR), use_only_19x19=use_only_19x19)
+        test_data = collect_ownership_data(os.path.join(root_dir, TEST_DIR), use_only_19x19=use_only_19x19, log_pdf=False)
         with open(pickle_test_path, "wb") as f:
             cloudpickle.dump(test_data, f)
 
@@ -566,7 +578,9 @@ def train(
             for folder in os.listdir(unzipped):
                 small_counter += 1
                 cur_pickle_path = os.path.join(root_dir, TRAIN_DIR, f'datasmall{small_counter:04}.pkl')
-                partial_data = collect_ownership_data(os.path.join(unzipped, folder), use_only_19x19=use_only_19x19)
+                vis_path = os.path.join(root_dir, VIS_DIR, f'vis{small_counter:04}.pdf')
+                os.makedirs(os.path.dirname(vis_path), exist_ok=True)
+                partial_data = collect_ownership_data(os.path.join(unzipped, folder), use_only_19x19=use_only_19x19, log_pdf=True, vis_path=vis_path)
                 with open(cur_pickle_path, "wb") as f:
                     cloudpickle.dump(partial_data, f)
                 shutil.rmtree(os.path.join(unzipped, folder), ignore_errors=True)
