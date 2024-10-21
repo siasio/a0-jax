@@ -8,6 +8,7 @@ import os
 import pickle
 import random
 import shutil
+import traceback
 import zipfile
 from functools import partial
 from typing import Callable
@@ -24,13 +25,15 @@ import opax
 import optax
 import pax
 from opax.transform import GradientTransformation
-from torch.fx.experimental.symbolic_shapes import eval_is_non_overlapping_and_dense
+# from torch.fx.experimental.symbolic_shapes import eval_is_non_overlapping_and_dense
 
 import data_vis
 from jax_utils import batched_policy, import_class
 from policies.resnet_policy import TransferResnet
 from legacy.local_pos_masks import AnalyzedPosition
 import datetime
+
+from sgf_utils.game import IllegalMoveException
 
 EPSILON = 1e-9  # a very small positive value
 TRAIN_DIR = "zip_logs_new"
@@ -109,6 +112,7 @@ def collect_ownership_data(log_path, use_only_19x19=True, log_pdf=True, num_page
     data = []
     num_sgfs_to_log = num_pages_per_log * num_sgfs_per_page
     sgfs_to_log = []
+    num_games = num_positions = 0
     for tupla in os.walk(log_path):
         dir, inside_dirs, files = tupla
         for file in files:
@@ -118,6 +122,7 @@ def collect_ownership_data(log_path, use_only_19x19=True, log_pdf=True, num_page
             with open(file, 'r') as f:
                 gtp_games = f.read().splitlines()
                 for gtp_game in gtp_games:
+                    num_games += 1
                     a0pos = get_position(json.loads(gtp_game))
                     if a0pos is None:
                         # print(f'Bad log found in {file}: {gtp_game}')
@@ -127,18 +132,29 @@ def collect_ownership_data(log_path, use_only_19x19=True, log_pdf=True, num_page
                         continue
                     move_num = a0pos.move_num
                     try:
-                        data_list = a0pos.get_single_local_pos(move_num=move_num)
-                    except Exception as e:
-                        # print(e)
+                        data_list = a0pos.get_single_local_pos(move_num=move_num, use_secure_territories=False)
+                    except IllegalMoveException as e:
+                        print(a0pos.game.root.sgf())
+                        print(e)
                         exception_counter += 1
                         continue
+                    except Exception as e:
+                        traceback.print_exc()
+                        exception_counter += 1
+                        continue
+                    if len(data_list) == 0:
+                        # print("No data list found")
+                        continue
+                    num_positions += len(data_list)
 
                     if log_pdf and len(sgfs_to_log) < num_sgfs_to_log:
-                        datapoint = random.choice(data_list)
+                        datapoint = data_list[0]
                         sgf_for_vis = datapoint[-1]
                         sgfs_to_log.append(sgf_for_vis)
-                    elif len(sgfs_to_log) == num_sgfs_to_log:
-                        data_vis.visualize(sgfs_to_log, log_path)
+                    elif len(sgfs_to_log) == num_sgfs_to_log and log_pdf:
+                        data_vis.visualize(sgfs_to_log, vis_path)
+                        sgfs_to_log = []
+                        log_pdf = False
                     for datapoint in data_list:
                         mask, position_list, coords, color, value, sente, _ = datapoint
                         has_next_move = True
@@ -161,7 +177,7 @@ def collect_ownership_data(log_path, use_only_19x19=True, log_pdf=True, num_page
                                                            board_mask=jnp.array(a0pos.board_mask),
                                                            value=jnp.array(value))
                         data.append(example)
-    print(f'{log_path} Exception counter: {exception_counter}')
+    print(f'{log_path} Exception counter: {exception_counter} Num games: {num_games} Num positions: {num_positions}, Average: {num_positions / num_games:.2f} positions per game')
     return data
 
 
@@ -550,8 +566,11 @@ def train(
             bms.append(float(backbone_multiplier))
             indices.append(float(iteration-1))
         pickle_path = os.path.join(root_dir, TRAIN_DIR, f'datasmall{iteration:04}.pkl')
+        pickle_files = [f for f in os.listdir(os.path.dirname(pickle_path)) if f.endswith('.pkl')]
         if not os.path.isfile(pickle_path):
             last_unpacked += 1
+            if len(pickle_files) == 0:
+                last_unpacked = 1
             zip_path = os.path.join(root_dir, TRAIN_DIR, f'{last_unpacked:04}.zip')
             if not os.path.exists(zip_path[:-4]):
                 try:
