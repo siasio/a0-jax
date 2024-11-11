@@ -148,13 +148,16 @@ class OwnershipHead(pax.Module):
         initial_dim = dim + 2 if include_boardmask else dim + 1
         if include_input:
             initial_dim = initial_dim + 9
-        self.ownership_head = pax.Sequential(
-            pax.Conv2D(initial_dim, dim, 1),
-            pax.BatchNorm2D(dim, True, True),
-            jax.nn.relu,
-            pax.Conv2D(dim, 1, 1, padding="VALID"),
-            jnp.tanh,
-        )
+        # self.ownership_head = pax.Sequential(
+        #     pax.Conv2D(initial_dim, dim, 1),
+        #     pax.BatchNorm2D(dim, True, True),
+        #     jax.nn.relu,
+        #     pax.Conv2D(dim, 1, 1, padding="VALID"),
+        #     jnp.tanh,
+        # )
+
+
+
         #self.policy_head_old = pax.Sequential(
             # pax.Conv2D(dim, dim, kernel_shape=input_dims, padding="VALID"),
             # pax.BatchNorm2D(dim, True, True),
@@ -176,16 +179,16 @@ class OwnershipHead(pax.Module):
 
     def __call__(self, x, batched=False):
         action_logits = self.policy_head(x)
-        ownership = self.ownership_head(x)
+        # ownership = self.ownership_head(x)
 
         #if batched:
         #    return action_logits[:, 0, 0, :], ownership[:, 0, 0, :]
         #else:
         #    return action_logits[0, 0, 0, :], ownership[0, 0, 0, :]
         if batched:
-            return jnp.squeeze(action_logits, axis=(1, 2)), jnp.squeeze(ownership, axis=3)
+            return jnp.squeeze(action_logits, axis=(1, 2)),  # jnp.squeeze(ownership, axis=3)
         else:
-            return jnp.squeeze(action_logits[0, ...]), jnp.squeeze(ownership[0, ...])
+            return jnp.squeeze(action_logits[0, ...]),  # jnp.squeeze(ownership[0, ...])
 
 
 class TransferResnet(pax.Module):
@@ -210,7 +213,7 @@ class TransferResnet(pax.Module):
     #parameters = pax.parameters_method("head", "backbone")
 
     def __call__(self, input: List[chex.Array], batched: bool = False):
-        input_x, mask, board_mask = input
+        input_x, mask = input  # was: , board_mask
         input_x = input_x.astype(jnp.float32)
         # assert jnp.sum(input_x[..., -2]) <= jnp.sum(input_x[..., -3]), "Input not in the canonical form!"
         # if jnp.sum(input_x[..., -2]) > jnp.sum(input_x[..., -3]):
