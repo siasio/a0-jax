@@ -718,6 +718,7 @@ class ChunkData:
             prev_pos = prev_pos.astype(np.int8)
             segments = segments.astype(np.uint8)
             distances = distances.astype(np.uint8)
+            total_moves = datapoint.get('total_moves', 361)
             for identifier, lp in local_pos.items():
                 size_factor = self.size_factors.get(lp['size'], 1.)
                 mtl = lp['moves_till_end']
@@ -730,7 +731,7 @@ class ChunkData:
                 # But it shouldn't matter, I think
                 local_moves = lp.get('local_moves', [])
                 if len(local_moves) < 8:
-                    local_moves += [(None, False, 0)]
+                    local_moves += [(None, False, 0, total_moves + 1)]
                 for i, (move, sente, dist, move_num) in enumerate(local_moves, 1):
                     mtl_factor = self.mtl_factors.get(mtl, 1.)
                     sente_factor = 1.
