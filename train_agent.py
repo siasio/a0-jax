@@ -402,6 +402,7 @@ def train(
         checkpoint_period=500,
         small_benchmark_period=2000,
         big_benchmark_period=10_000,
+        conf_file='analysis_config/a0kata_estimated_1024a.yaml',
 ):
     if root_dir == ".":
         root_dir = os.path.dirname(os.getcwd())
@@ -413,7 +414,6 @@ def train(
         num_actions=env.num_actions(),
     )
 
-    conf_file = 'analysis_config/a0kata_estimated_1024a.yaml'
     with open(conf_file, 'r') as f:
         config = yaml.safe_load(f)
     config['evaluator_kwargs']['a0_ckpt'] = f'{trained_ckpt_filename}'
