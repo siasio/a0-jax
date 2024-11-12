@@ -389,7 +389,7 @@ def train(
         agent_class="policies.resnet_policy.ResnetPolicyValueNet128",
         training_batch_size: int = 256,  # Originally 128 but maybe I'm getting OOM
         num_steps: int = 80_000,
-        learning_rate: float = 1e-3 / 4,  # Originally 0.01,
+        learning_rate: float = 1e-3,  # Originally 0.01,
         ckpt_filename: str = "go_agent_9x9_128_sym.ckpt",
         root_dir: str = ".",
         random_seed: int = 42,
@@ -397,7 +397,13 @@ def train(
         lr_decay_steps: int = 10_000,  # My full epoch is likely shorter than 100_000 steps
         backbone_lr_steps: int = 0,  # 3_000,  # 3_000, #15_000,  # was 25_000 in August
         # use_only_19x19: bool = True,
+        training_data_dir='../KifuMining/endgame_data/processed',
+        prepared_dir='prep',
         only_prepared_data: bool = True,
+        log_period=10,
+        checkpoint_period=500,
+        small_benchmark_period=2000,
+        big_benchmark_period=10_000,
 ):
     if root_dir == ".":
         root_dir = os.path.dirname(os.getcwd())
@@ -484,10 +490,8 @@ def train(
     stats_pickle_name = trained_ckpt_path.rsplit('.', 1)[0] + '_stats.pkl'
 
     if only_prepared_data:
-        prepared_dir = 'prep'
         pickle_files = [os.path.join(prepared_dir, f) for f in os.listdir(prepared_dir)]
     else:
-        training_data_dir = '../KifuMining/endgame_data/processed'
         pickle_files = [os.path.join(training_data_dir, f) for f in os.listdir(training_data_dir)]
 
     chunk_iterator = itertools.cycle(enumerate(pickle_files[:80], 1))
@@ -496,10 +500,7 @@ def train(
 
     losses = []
     batch = []
-    log_period = 10
-    checkpoint_period = 500
-    small_benchmark_period = 2000
-    big_benchmark_period = 10_000
+
     tqdm_bar = tqdm(range(1, num_steps + 1))
     epoch_num = 0
 
@@ -508,7 +509,7 @@ def train(
         file_num, pickle_file = next(custom_chunk_iterator)
         # print(file_num, pickle_file)
         try:
-            datapoints_iterator = iter(ChunkData(pickle_file, cache=True, only_prepared_data=only_prepared_data))
+            datapoints_iterator = iter(ChunkData(pickle_file, cache=True, only_prepared_data=only_prepared_data, save_dir=prepared_dir))
             return datapoints_iterator, file_num
         except:
             gc.collect()
@@ -631,12 +632,12 @@ def profiling_decorator(requested_profiling):
 
 class ChunkData:
     @profiling_decorator(False)
-    def __init__(self, pickle_file, cache=False, only_prepared_data=True):
+    def __init__(self, pickle_file, cache=False, only_prepared_data=True, save_dir='prep'):
         if only_prepared_data:
             with open(pickle_file, 'rb') as f:
                 self.items = pickle.load(f)
         else:
-            prep_path = os.path.join('prep', os.path.basename(pickle_file[:-4]) + '-prep.pkl')
+            prep_path = os.path.join(save_dir, os.path.basename(pickle_file[:-4]) + '-prep.pkl')
             if os.path.isfile(prep_path):
                 with open(prep_path, 'rb') as f:
                     self.items = pickle.load(f)
