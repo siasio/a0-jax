@@ -46,7 +46,7 @@ EPSILON = 1e-9  # a very small positive value
 TRAIN_DIR = "zip_logs_new"
 TEST_DIR = "test_dir"
 VIS_DIR = "vis_pdf"
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = '.59'
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = '.79'
 
 
 @chex.dataclass(frozen=True)
