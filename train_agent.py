@@ -731,7 +731,7 @@ class ChunkData:
                 local_moves = lp.get('local_moves', [])
                 if len(local_moves) < 8:
                     local_moves += [(None, False, 0)]
-                for i, (move, sente, dist) in enumerate(local_moves, 1):
+                for i, (move, sente, dist, move_num) in enumerate(local_moves, 1):
                     mtl_factor = self.mtl_factors.get(mtl, 1.)
                     sente_factor = 1.
                     if move is not None:
