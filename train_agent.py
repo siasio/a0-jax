@@ -32,9 +32,7 @@ import yaml
 from opax.transform import GradientTransformation
 from tqdm import tqdm
 
-# from torch.fx.experimental.symbolic_shapes import eval_is_non_overlapping_and_dense
-
-import data_vis
+# import data_vis
 from benchmark import get_positions, run_benchmark
 from evaluators.a0jax_evaluator import color_to_pl
 from jax_utils import batched_policy, import_class
