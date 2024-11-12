@@ -686,6 +686,7 @@ class ChunkData:
                 }
                 self.items = self.make_items()
                 if cache:
+                    os.makedirs(save_dir, exist_ok=True)
                     with open(prep_path, 'wb') as f:
                         pickle.dump(self.items, f)
         self.num_items = len(self.items)
